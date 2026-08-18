@@ -1379,6 +1379,27 @@ body::after{
   font-size:calc(1em + 2pt); font-weight:800; white-space:nowrap;
 }
 
+/* ── T-Code category groups ────────────────────────────────────────────── */
+.tc-cat-bar{ display:flex; gap:6px; margin-bottom:10px; }
+.tc-cat{ border:1px solid var(--line); border-radius:var(--radius-md); margin-bottom:8px; overflow:hidden; }
+.tc-cat-head{
+  display:flex; align-items:center; gap:9px; padding:11px 13px; cursor:pointer;
+  background:var(--surface-2,#f4f6fa); user-select:none;
+  transition:background var(--dur) var(--ease);
+}
+.tc-cat-head:hover{ background:var(--surface-3,#e9edf4); }
+.tc-cat-head .chev{
+  font-size:11px; color:var(--steel-600); transition:transform var(--dur) var(--ease);
+}
+.tc-cat.open .tc-cat-head .chev{ transform:rotate(90deg); }
+.tc-cat-name{ flex:1; font-weight:700; font-size:13.5px; letter-spacing:-.005em; }
+/* Collapsed by default; grid-template-rows animates to a height the content
+   defines, so no fixed max-height has to be guessed per category. */
+.tc-cat-body{ display:grid; grid-template-rows:0fr; transition:grid-template-rows var(--dur) var(--ease); }
+.tc-cat.open .tc-cat-body{ grid-template-rows:1fr; }
+.tc-cat-body > *{ overflow:hidden; min-height:0; }
+.tc-cat .table-wrap{ border:0; border-radius:0; border-top:1px solid var(--line); }
+
 .ok-text{ color:var(--ok-500,#0f7b45); font-weight:600; }
 
 /* ── Build stamp ────────────────────────────────────────────────────────

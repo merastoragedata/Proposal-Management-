@@ -8,7 +8,7 @@
 /* Build stamp. Check the live site is running this file:
    open the browser console (F12) — the build id is printed on load.
    It is also shown at the bottom-right of the login screen. */
-window.__BUILD = "2026-08-06-r";
+window.__BUILD = "2026-08-06-s";
 document.addEventListener("DOMContentLoaded", function(){
   var el = document.createElement("div");
   el.id = "build-stamp";
@@ -50,7 +50,7 @@ window.__EARLY_BOOT = (function () {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Space+Grotesk:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" onload="this.onload=null;this.rel='stylesheet'">
 <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Space+Grotesk:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap"></noscript>
-<link rel="stylesheet" href="styles.css?v=2026-08-06-r">
+<link rel="stylesheet" href="styles.css?v=2026-08-06-s">
 </head>
 <body>
 <div id="app"></div>
@@ -5888,38 +5888,83 @@ function renderTCPContent() {
   if (TCP.subTab==='tcodes') renderTCodesTab(zone); else renderProcessesTab(zone);
 }
 
+// Categories come from the data, never a hardcoded list — so a category typed
+// into the Add form appears here immediately with no code change.
+function tcodeCategories(items){
+  const seen = [];
+  (items||[]).forEach(it=>{ const c=(it.category||'').trim(); if(c && seen.indexOf(c)<0) seen.push(c); });
+  return seen.sort((a,b)=>a.localeCompare(b));
+}
+
 function renderTCodesTab(zone) {
   const allItems = ST.tcodesCache;
   const q = (TCP.tSearch||'').toLowerCase();
   const items = q ? allItems.filter(it =>
-    it.tcode.toLowerCase().includes(q) || it.purpose.toLowerCase().includes(q) || it.description.toLowerCase().includes(q)
+    it.tcode.toLowerCase().includes(q) || it.purpose.toLowerCase().includes(q) ||
+    it.description.toLowerCase().includes(q) || (it.category||'').toLowerCase().includes(q)
   ) : allItems;
+
+  // Group, keeping anything uncategorised visible at the end rather than
+  // letting it disappear — a T Code with no category is still a T Code.
+  const groups = {};
+  items.forEach(it=>{ const c=(it.category||'').trim() || 'Uncategorised'; (groups[c]=groups[c]||[]).push(it); });
+  const names = Object.keys(groups).sort((a,b)=>
+    a==='Uncategorised' ? 1 : b==='Uncategorised' ? -1 : a.localeCompare(b));
+
+  TCP.openCats = TCP.openCats || {};
+  const isOpen = (c)=> q ? true : (TCP.openCats[c] !== false);   // a search opens everything
+
+  const rowsFor = (list)=> list.map((it,i)=>`
+    <tr>
+      <td class="mono text-muted">${i+1}</td>
+      <td class="mono fw-700">${escapeHtml(it.tcode)}</td>
+      <td>${escapeHtml(it.purpose)}</td>
+      <td class="rich-cell">${richDisplay(it.description)}</td>
+      <td class="text-sm text-muted">${escapeHtml(it.remarks||'—')}</td>
+      <td>${tcpImageCell('tcode', it.tcode, it.image)}</td>
+      <td>${tcpRowActions('tcode', it.tcode, it.addedBy)}</td>
+    </tr>`).join('');
+
   zone.innerHTML = `
     <div class="card">
       <div class="card-head">
         <h3>T Codes (SAP) <span class="badge badge-neutral">${items.length}${q?` of ${allItems.length}`:''}</span></h3>
         <button class="btn btn-gold btn-sm" onclick="openTCodeModal()">+ Add T Code</button>
       </div>
-      <input type="text" id="tcp-tcode-search" placeholder="Search T Code, purpose, or description…" value="${escapeHtml(TCP.tSearch||'')}" oninput="onTcpTCodeSearch(this.value)" style="margin-bottom:12px">
-      <div class="table-wrap" style="max-height:540px; overflow-y:auto">
-        <table>
-          <thead><tr><th>Sr.</th><th>T Code</th><th>Purpose</th><th style="width:28%">Description</th><th style="width:18%">Remarks</th><th>Image</th><th></th></tr></thead>
-          <tbody>
-            ${items.length ? items.map((it,i)=>`
-              <tr>
-                <td class="mono text-muted">${i+1}</td>
-                <td class="mono fw-700">${escapeHtml(it.tcode)}</td>
-                <td>${escapeHtml(it.purpose)}</td>
-                <td class="rich-cell">${richDisplay(it.description)}</td>
-                <td class="text-sm text-muted">${escapeHtml(it.remarks||'—')}</td>
-                <td>${tcpImageCell('tcode', it.tcode, it.image)}</td>
-                <td>${tcpRowActions('tcode', it.tcode, it.addedBy)}</td>
-              </tr>`).join('') : `<tr><td colspan="7"><div class="empty-state"><div class="ic">🔖</div>${q?'No T Codes match your search.':'No T Codes added yet.'}</div></td></tr>`}
-          </tbody>
-        </table>
-      </div>
+      <input type="text" id="tcp-tcode-search" placeholder="Search T Code, purpose, category…" value="${escapeHtml(TCP.tSearch||'')}" oninput="onTcpTCodeSearch(this.value)" style="margin-bottom:10px">
+      ${names.length>1 ? `<div class="tc-cat-bar">
+        <button class="btn btn-ghost btn-sm" onclick="setAllTCodeCats(true)">Expand all</button>
+        <button class="btn btn-ghost btn-sm" onclick="setAllTCodeCats(false)">Collapse all</button>
+      </div>` : ''}
+      ${names.length ? names.map(cat=>`
+        <div class="tc-cat${isOpen(cat)?' open':''}">
+          <div class="tc-cat-head" onclick="toggleTCodeCat('${escapeHtml(cat).replace(/'/g,"\\'")}')">
+            <span class="chev">▸</span>
+            <span class="tc-cat-name">${escapeHtml(cat)}</span>
+            <span class="badge badge-neutral">${groups[cat].length}</span>
+          </div>
+          <div class="tc-cat-body">
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Sr.</th><th>T Code</th><th>Purpose</th><th style="width:28%">Description</th><th style="width:18%">Remarks</th><th>Image</th><th></th></tr></thead>
+                <tbody>${rowsFor(groups[cat])}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>`).join('')
+        : `<div class="empty-state"><div class="ic">🔖</div>${q?'No T Codes match your search.':'No T Codes added yet.'}</div>`}
     </div>
   `;
+}
+function toggleTCodeCat(cat){
+  TCP.openCats = TCP.openCats || {};
+  TCP.openCats[cat] = (TCP.openCats[cat] === false);
+  renderTCodesTab(document.getElementById('tcp-content'));
+}
+function setAllTCodeCats(open){
+  TCP.openCats = {};
+  tcodeCategories(ST.tcodesCache).concat(['Uncategorised']).forEach(c=> TCP.openCats[c] = !!open);
+  renderTCodesTab(document.getElementById('tcp-content'));
 }
 let _tcpTcodeT = null;
 function onTcpTCodeSearch(val) {
@@ -6064,6 +6109,12 @@ function openTCodeModal(origTcode=null) {
     <div class="modal-head"><h3>${item?'Edit':'Add'} T Code</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
     <div class="field"><label>T Code</label><input type="text" id="tc-code" value="${item?escapeHtml(item.tcode):''}" ${item?'disabled':''}></div>
     <div class="field"><label>Purpose</label><input type="text" id="tc-purpose" value="${item?escapeHtml(item.purpose):''}"></div>
+    <div class="field"><label>Category</label>
+      <input type="text" id="tc-category" list="tc-cat-list" placeholder="Pick one, or type a new category"
+             value="${item?escapeHtml(item.category||''):''}">
+      <datalist id="tc-cat-list">${tcodeCategories(ST.tcodesCache).map(c=>`<option value="${escapeHtml(c)}">`).join('')}</datalist>
+      <p class="hint">Type anything new and it becomes a category — no list to maintain.</p>
+    </div>
     <div class="field"><label>Description</label>${richEditorHtml('tc-desc', item?item.description:'')}</div>
     <div class="field"><label>Remarks</label><textarea id="tc-remarks">${item?escapeHtml(item.remarks||''):''}</textarea></div>
     <div id="tc-error" class="error-text" style="display:none"></div>
@@ -6073,6 +6124,7 @@ function openTCodeModal(origTcode=null) {
 async function submitTCode(origTcode) {
   const tcode = document.getElementById('tc-code').value.trim();
   const purpose = document.getElementById('tc-purpose').value.trim();
+  const category = (document.getElementById('tc-category')||{value:''}).value.trim();
   const description = richValue('tc-desc');
   const remarks = document.getElementById('tc-remarks').value.trim();
   const err = document.getElementById('tc-error');
@@ -6082,9 +6134,9 @@ async function submitTCode(origTcode) {
   await withSaveStatus(btn, async () => {
     let res;
     if (origTcode) {
-      res = await apiPost({action:'updateTCode', item:{tcode, origTcode, purpose, description, remarks}, userId:ST.user.id, role:ST.user.role});
+      res = await apiPost({action:'updateTCode', item:{tcode, origTcode, purpose, description, remarks, category}, userId:ST.user.id, role:ST.user.role});
     } else {
-      res = await apiPost({action:'addTCode', item:{tcode, purpose, description, remarks, addedBy:ST.user.id}});
+      res = await apiPost({action:'addTCode', item:{tcode, purpose, description, remarks, category, addedBy:ST.user.id}});
     }
     if (!res.ok) { err.textContent = res.error||'Failed.'; err.style.display='block'; return false; }
     await refreshTCP();
