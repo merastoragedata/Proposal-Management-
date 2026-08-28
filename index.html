@@ -106,6 +106,7 @@ const ST = {
   defaultSorVersion: '',        // admin-pinned default for new estimates
   estCache: {},                 // { id: {estimate, items} } — instant re-open
   sorVersionCounts: {},
+  hiddenSorVersions: [],
   nonSorCache: [],
   usersCache: [],
   tcodesCache: [],
@@ -403,12 +404,23 @@ function resolveLatestVersion(versions) {
   // Fallback: proper lexicographic sort (not insertion order)
   return [...versions].sort().pop();
 }
+// SOR versions an admin has hidden are invisible to everyone except admin —
+// not selectable for new estimates, not shown on the Rates page, not used
+// as a fallback match, and never resolved as "latest"/"default" for a
+// regular user. Admin always sees the full list (to manage visibility).
+function visibleSorVersions() {
+  if (isAdmin()) return ST.sorVersions || [];
+  const hidden = ST.hiddenSorVersions || [];
+  return (ST.sorVersions || []).filter(v => !hidden.includes(v));
+}
 // The version pre-selected for NEW estimates. Admin can pin a default; when
-// unset (or invalid) it falls back to the newest version. Rate LOOKUPS still
-// cascade latest→older regardless of this default.
+// unset (or invalid) it falls back to the newest VISIBLE version. Rate
+// LOOKUPS cascade: selected version → Non-SOR → older SOR versions
+// (reverse chronological), never a version newer than the one selected,
+// and never a hidden version.
 function resolveDefaultVersion() {
-  if (ST.defaultSorVersion && (ST.sorVersions||[]).includes(ST.defaultSorVersion)) return ST.defaultSorVersion;
-  return resolveLatestVersion(ST.sorVersions);
+  if (ST.defaultSorVersion && visibleSorVersions().includes(ST.defaultSorVersion)) return ST.defaultSorVersion;
+  return resolveLatestVersion(visibleSorVersions());
 }
 
 // ── Shared image compression — re-encodes via canvas at reduced quality/
@@ -610,6 +622,7 @@ async function enterApp(preloadedBoot) {
     ST.defaultSorVersion = boot.defaultSorVersion||'';
     if (boot.userDefaultSignatories && boot.userDefaultSignatories.length===4) ST.user.defaultSignatories = boot.userDefaultSignatories;
     ST.sorVersionCounts = boot.sorVersionCounts||{};
+    ST.hiddenSorVersions = boot.hiddenSorVersions||[];
     ST.nonSorCache = boot.nonSor||[];
     ST.tcodesCache = boot.tcodes||[];
     ST.processesCache = boot.processes||[];
@@ -647,7 +660,7 @@ async function enterApp(preloadedBoot) {
   }
 }
 async function loadSorData() {
-  const latest = resolveLatestVersion(ST.sorVersions);
+  const latest = resolveLatestVersion(visibleSorVersions());
   if (latest) {
     try { const r = await api('getSOR', {version: latest}); if (r.ok) ST.sorCache = r.items||[]; } catch(e){}
   }
@@ -702,7 +715,7 @@ function prefetchRemainingSOR() {
 const _sorVersionsLoaded = new Set();
 async function ensureSorVersionLoaded(version){
   if (!version) return true;
-  const latest = resolveLatestVersion(ST.sorVersions);
+  const latest = resolveLatestVersion(visibleSorVersions());
   if (version === latest) return ensureSorLoaded();
   if (_sorVersionsLoaded.has(version)) return true;
   _sorVersionsLoaded.add(version);
@@ -1382,7 +1395,7 @@ async function createEstimateCopy(id) {
       sourceEst = normalizeLoadedEstimate(res.estimate); sourceItems = res.items||[];
     }
 
-    const latestVersion = resolveLatestVersion(ST.sorVersions);
+    const latestVersion = resolveLatestVersion(visibleSorVersions());
     const rematched = sourceItems.map(it => rematchItemAgainstCurrentCatalog(it, latestVersion));
     const newlyCreatedCount = rematched.filter(r => r._autoCreated).length;
     const olderVersionCount = rematched.filter(r => r._fromOlderVersion).length;
@@ -1427,31 +1440,49 @@ async function createEstimateCopy(id) {
   }
 }
 
-// ── The actual re-matching cascade for a single item ──
-function rematchItemAgainstCurrentCatalog(item, latestVersion) {
-  // 1. Latest SOR version, exact item_no
-  if (latestVersion) {
-    const inLatest = ST.sorCache.find(s => s.item_no===item.item_no && s.version===latestVersion);
-    if (inLatest) {
-      return {...inLatest, qty: item.qty, fullDescription: item.fullDescription||'', remarks: item.remarks||'', isCustom: false, version: latestVersion};
-    }
+// ── Shared catalog lookup cascade, used everywhere an item needs a rate ──
+// (estimate copy/re-match, ZEST03 sync, Final Estimate build). Order:
+//   1. The selected/base SOR version itself, exact item_no.
+//   2. Non-SOR catalog, exact item_no.
+//   3. Any OLDER visible SOR version (never a newer one), exact item_no —
+//      when several match, the most recent of those older versions wins.
+// Hidden SOR versions are never matched against (see visibleSorVersions()).
+function findCatalogMatch(itemNo, selectedVersion) {
+  if (selectedVersion) {
+    const inSelected = ST.sorCache.find(s => s.item_no===itemNo && s.version===selectedVersion);
+    if (inSelected) return {...inSelected, source:'sor', matchedVersion: selectedVersion, fromOlderVersion:false};
   }
-  // 2. Any older SOR version, exact item_no (prefer the most recent among matches)
-  const olderMatches = ST.sorCache.filter(s => s.item_no===item.item_no && s.version!==latestVersion);
+  const inNonSor = ST.nonSorCache.find(n => n.item_no===itemNo);
+  if (inNonSor) return {...inNonSor, version:'NONSOR', source:'nonsor', matchedVersion:'NONSOR', fromOlderVersion:false};
+  const visible = visibleSorVersions();
+  const selKey = selectedVersion ? versionSortKey(selectedVersion) : Infinity;
+  const olderMatches = ST.sorCache.filter(s =>
+    s.item_no===itemNo && s.version!==selectedVersion &&
+    visible.includes(s.version) && versionSortKey(s.version) < selKey);
   if (olderMatches.length) {
     const best = [...olderMatches].sort((a,b)=>versionSortKey(b.version)-versionSortKey(a.version))[0];
+    return {...best, source:'sor', matchedVersion: best.version, fromOlderVersion:true};
+  }
+  return null;
+}
+
+// ── The actual re-matching cascade for a single item ──
+function rematchItemAgainstCurrentCatalog(item, latestVersion) {
+  const match = findCatalogMatch(item.item_no, latestVersion);
+  if (match && match.source==='sor' && !match.fromOlderVersion) {
+    return {...match, qty: item.qty, fullDescription: item.fullDescription||'', remarks: item.remarks||'', isCustom: false, version: match.matchedVersion};
+  }
+  if (match && match.source==='sor' && match.fromOlderVersion) {
     return {
-      ...best, qty: item.qty, fullDescription: item.fullDescription||'', isCustom: false,
-      remarks: `Carried forward from older SOR version "${best.version}" — not present in the latest SOR. ${item.remarks||''}`.trim(),
+      ...match, qty: item.qty, fullDescription: item.fullDescription||'', isCustom: false, version: match.matchedVersion,
+      remarks: `Carried forward from older SOR version "${match.matchedVersion}" — not present in ${latestVersion||'the selected SOR'}. ${item.remarks||''}`.trim(),
       _fromOlderVersion: true
     };
   }
-  // 3. Non-SOR catalog, exact item_no
-  const inNonSor = ST.nonSorCache.find(n => n.item_no===item.item_no);
-  if (inNonSor) {
-    return {...inNonSor, qty: item.qty, fullDescription: item.fullDescription||'', version:'NONSOR', isCustom: true, remarks: item.remarks||inNonSor.remarks||''};
+  if (match && match.source==='nonsor') {
+    return {...match, qty: item.qty, fullDescription: item.fullDescription||'', version:'NONSOR', isCustom: true, remarks: item.remarks||match.remarks||''};
   }
-  // 4. Not found anywhere — auto-create as a new Non-SOR entry, preserving
+  // Not found anywhere — auto-create as a new Non-SOR entry, preserving
   // the original item's data, with the exact requested remark text.
   return {
     item_no: item.item_no, description: item.description, fullDescription: item.fullDescription||'',
@@ -2316,7 +2347,7 @@ function goToStep2() {
 function renderVersionCheckboxes(containerId, selectedVersions, onChangeFn, showNonSOR=true) {
   const container = document.getElementById(containerId);
   if (!container) return;
-  const versions = ST.sorVersions;
+  const versions = visibleSorVersions();
   const latest = resolveLatestVersion(versions);
   if (!versions.length) {
     container.innerHTML = `
@@ -2376,7 +2407,7 @@ function versionSelectAll(containerId, onChangeFn) {
   if (window[onChangeFn]) window[onChangeFn](getCheckedVersions(containerId));
 }
 function versionSelectLatest(containerId, onChangeFn) {
-  const latest = resolveLatestVersion(ST.sorVersions);
+  const latest = resolveLatestVersion(visibleSorVersions());
   document.querySelectorAll(`#${containerId} input[type=checkbox]`).forEach(cb=>{
     const v = cb.closest('.check-option').dataset.version;
     const on = v===latest;
@@ -5099,10 +5130,15 @@ function smartPdfColWidths(headers, dataRows) {
 const PR_BANNER_FILL = 'FF9FC5E8'; // light blue "In Item Overview" banner
 const PR_LABEL_FILL  = 'FFD9D9D9'; // gray column-label row
 
+function matGroupForItem(it) {
+  if (it.isCustom || it.version==='NONSOR' || !it.version) return '';
+  const hit = ST.sorCache.find(s=>s.item_no===it.item_no && s.version===it.version);
+  return hit ? (hit.matGroup||'') : '';
+}
 function prItemOverviewSheetRows(items, ps) {
   // Columns: A=Sr, B=Item category, C=Account assignment, D=Material,
   // E=Short text, F=quantity, I=Delivery date, J=Purchasing group,
-  // L=Plant, M=Store location, S=Requisitioner
+  // K=Material Group, L=Plant, M=Store location, S=Requisitioner
   const header1 = new Array(19).fill('');
   header1[1] = 'In Item Overview';
   const header2 = new Array(19).fill('');
@@ -5110,7 +5146,7 @@ function prItemOverviewSheetRows(items, ps) {
   const header3 = new Array(19).fill('');
   header3[1]='Item category'; header3[2]='Account assingmnet'; header3[3]='Material';
   header3[4]='Short text'; header3[5]='quantity'; header3[8]='Delivery date';
-  header3[9]='Purchasing group'; header3[11]='Plant'; header3[12]='Store location'; header3[18]='Requistioner';
+  header3[9]='Purchasing group'; header3[10]='Material Group'; header3[11]='Plant'; header3[12]='Store location'; header3[18]='Requistioner';
 
   const rows = [header1, header2, header3];
   items.forEach((it, idx) => {
@@ -5121,6 +5157,7 @@ function prItemOverviewSheetRows(items, ps) {
     row[5] = it.qty;
     row[8] = ps.deliveryDate;
     row[9] = isFinite(Number(ps.purchaseGroup)) ? Number(ps.purchaseGroup) : ps.purchaseGroup;
+    row[10] = matGroupForItem(it);
     row[11] = isFinite(Number(ps.plant)) ? Number(ps.plant) : ps.plant;
     row[12] = ps.storageLocation;
     row[18] = ps.requisitioner;
@@ -5139,7 +5176,7 @@ function prOMSheetRows(items, ps) {
   const header3 = new Array(19).fill('');
   header3[1]='Item Category'; header3[2]='Account assingmnet'; header3[3]='Material';
   header3[4]='Short text'; header3[5]='quantity'; header3[6]='UOM'; header3[8]='Delivery date';
-  header3[9]='Purchasing group'; header3[11]='Plant'; header3[12]='Store location'; header3[18]='Requistioner';
+  header3[9]='Purchasing group'; header3[10]='Material Group'; header3[11]='Plant'; header3[12]='Store location'; header3[18]='Requistioner';
   const overviewRow = new Array(19).fill('');
   overviewRow[0]=1; overviewRow[1]='D'; overviewRow[2]='U'; overviewRow[4]='O&M Services';
   overviewRow[5]=1; overviewRow[6]='AU'; overviewRow[8]=ps.deliveryDate;
@@ -5212,7 +5249,7 @@ async function exportPRFormatExcel() {
   if (supplyItems.length) {
     const rows = prItemOverviewSheetRows(supplyItems, ps);
     const ws = XLSXmod.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{wch:8.71},{wch:10.86},{wch:8},{wch:15},{wch:13},{wch:8.86},{wch:8.71},{wch:8},{wch:12.57},{wch:15.86},{wch:8.71},{wch:8},{wch:13.57},{wch:8.71},{wch:8},{wch:8},{wch:8},{wch:11.29},{wch:12.43}];
+    ws['!cols'] = [{wch:8.71},{wch:10.86},{wch:8},{wch:15},{wch:13},{wch:8.86},{wch:8.71},{wch:8},{wch:12.57},{wch:15.86},{wch:13},{wch:8},{wch:13.57},{wch:8.71},{wch:8},{wch:8},{wch:8},{wch:11.29},{wch:12.43}];
     prStylePass(ws, rows);
     ws['!luxeSkip']=true;
     XLSXmod.utils.book_append_sheet(wb, ws, 'For Supply  Material');
@@ -5220,7 +5257,7 @@ async function exportPRFormatExcel() {
   if (projectItems.length) {
     const rows = prItemOverviewSheetRows(projectItems, ps);
     const ws = XLSXmod.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{wch:8.71},{wch:10.86},{wch:8},{wch:15},{wch:13},{wch:8.86},{wch:8.71},{wch:8},{wch:12.57},{wch:15.86},{wch:8.71},{wch:8},{wch:13.57},{wch:8.71},{wch:8},{wch:8},{wch:8},{wch:11.29},{wch:12.43}];
+    ws['!cols'] = [{wch:8.71},{wch:10.86},{wch:8},{wch:15},{wch:13},{wch:8.86},{wch:8.71},{wch:8},{wch:12.57},{wch:15.86},{wch:13},{wch:8},{wch:13.57},{wch:8.71},{wch:8},{wch:8},{wch:8},{wch:11.29},{wch:12.43}];
     prStylePass(ws, rows);
     ws['!luxeSkip']=true;
     XLSXmod.utils.book_append_sheet(wb, ws, 'For Project Services');
@@ -5228,7 +5265,7 @@ async function exportPRFormatExcel() {
   if (omItems.length) {
     const rows = prOMSheetRows(omItems, ps);
     const ws = XLSXmod.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{wch:8.71},{wch:10.86},{wch:8},{wch:15},{wch:13},{wch:8.86},{wch:8.71},{wch:8},{wch:12.57},{wch:15.86},{wch:8.71},{wch:8},{wch:13.57},{wch:8.71},{wch:8},{wch:8},{wch:8},{wch:11.29},{wch:12.43}];
+    ws['!cols'] = [{wch:8.71},{wch:10.86},{wch:8},{wch:15},{wch:13},{wch:8.86},{wch:8.71},{wch:8},{wch:12.57},{wch:15.86},{wch:13},{wch:8},{wch:13.57},{wch:8.71},{wch:8},{wch:8},{wch:8},{wch:11.29},{wch:12.43}];
     prStylePass(ws, rows);
     ws['!luxeSkip']=true;
     XLSXmod.utils.book_append_sheet(wb, ws, 'For O&M Services');
@@ -5400,21 +5437,32 @@ async function sorUploadHandler(evt){
     const X = await ensureSheetJS();
     const wb = X.read(await file.arrayBuffer(), {type:'array'});
     const grid = X.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {header:1, blankrows:false, defval:''});
-    let hIdx = grid.findIndex(r=> r.some(c=>/(material\s*\/?\s*service\s*no|^item\s*no)/i.test(String(c).trim())));
-    if (hIdx<0) throw new Error('Header row with "Item No" (or "Material/Service No") not found.');
+    // Accepts either the simple template (a single "Item No"/"Material/Service No"
+    // column) OR the raw SAP SOR export (separate "Material" and "Service"
+    // columns, one populated per row depending on Type M/S).
+    let hIdx = grid.findIndex(r=> r.some(c=>/(material\s*\/?\s*service\s*no|^item\s*no)/i.test(String(c).trim()))
+      || (r.some(c=>/^material$/i.test(String(c).trim())) && r.some(c=>/^service$/i.test(String(c).trim()))));
+    if (hIdx<0) throw new Error('Header row with "Item No" (or "Material/Service No", or separate "Material" + "Service" columns) not found.');
     const H = grid[hIdx].map(c=>String(c).trim());
     const ci = {
-      mat:H.findIndex(c=>/(material\s*\/?\s*service\s*no|^item\s*no)/i.test(c)), desc:H.findIndex(c=>/description/i.test(c)),
-      uom:H.findIndex(c=>/uom|unit/i.test(c)), sec:H.findIndex(c=>/section/i.test(c)), rate:H.findIndex(c=>/rate|price/i.test(c)),
+      mat:H.findIndex(c=>/(material\s*\/?\s*service\s*no|^item\s*no)/i.test(c)),
+      matCol:H.findIndex(c=>/^material$/i.test(c)), svcCol:H.findIndex(c=>/^service$/i.test(c)),
+      desc:H.findIndex(c=>/description/i.test(c)),
+      uom:H.findIndex(c=>/uom|unit/i.test(c)), sec:H.findIndex(c=>/^section$/i.test(c)), rate:H.findIndex(c=>/rate|price/i.test(c)),
+      matgrp:H.findIndex(c=>/mat\s*group|mat\.?\s*grp/i.test(c)),
     };
+    const cellNo = (v)=>{ if (v===''||v==null) return ''; const n=Number(v); return String(Number.isFinite(n) && n!==0 ? Math.trunc(n) : v).trim(); };
     const items = [];
     for (let r=hIdx+1;r<grid.length;r++){
-      const row=grid[r]; const matNo=String(row[ci.mat]==null?'':row[ci.mat]).trim();
+      const row=grid[r];
+      let matNo = ci.mat>=0 ? String(row[ci.mat]==null?'':row[ci.mat]).trim() : '';
+      if (!matNo && ci.matCol>=0) matNo = cellNo(row[ci.matCol]);
+      if (!matNo && ci.svcCol>=0) matNo = cellNo(row[ci.svcCol]);
       if(!matNo) continue;
       let sec = (ci.sec>=0?String(row[ci.sec]).toLowerCase().trim():'') || (feClassify(matNo)||'supply');
       if (/etc|project/.test(sec)) sec='project'; else if (/o&m|om|service/.test(sec)) sec='om'; else if (/supply|material/.test(sec)) sec='supply';
       items.push({ item_no:matNo, description:ci.desc>=0?String(row[ci.desc]):'', uom:ci.uom>=0?String(row[ci.uom]):'',
-        section:sec, rate:ci.rate>=0?(parseFloat(row[ci.rate])||0):0 });
+        section:sec, rate:ci.rate>=0?(parseFloat(row[ci.rate])||0):0, mat_group: ci.matgrp>=0?String(row[ci.matgrp]==null?'':row[ci.matgrp]).trim():'' });
     }
     if (!items.length) throw new Error('No item rows found.');
     if (status) status.innerHTML = '<span class="spinner dark"></span> Publishing '+items.length+' items…';
@@ -5443,7 +5491,7 @@ function renderRPSor(zone) {
     <div class="collapse" style="margin-bottom:16px">
       <div class="collapse-head" onclick="toggleCollapse(this)"><span class="fw-700 text-sm">📤 Import SOR</span><span class="chev">▸</span></div>
       <div class="collapse-body"><div class="collapse-body-inner">
-        <p class="hint mb-1">Upload an Excel or CSV file with columns: <b>item_no, description, uom, rate, section</b> (auto-classified from the item number if left blank: 5+9 digits = Supply, 5+8 digits = O&amp;M, 3+9 digits = Project). Optionally include a <b>version</b> column to import multiple SOR versions from one file — rows without a version column use the name typed below.</p>
+        <p class="hint mb-1">Upload an Excel or CSV file with columns: <b>item_no, description, uom, rate, section</b> — or the raw SAP SOR export with separate <b>Material</b> / <b>Service</b> columns (auto-classified from the item number if left blank: 5+9 digits = Supply, 5+8 digits = O&amp;M, 3+9 digits = Project). An optional <b>Mat Group</b> column is stored against each item. Optionally include a <b>version</b> column to import multiple SOR versions from one file — rows without a version column use the name typed below.</p>
         <div class="field-row">
           <div class="field"><label>Default Version Name <span class="text-muted fw-600" style="font-weight:500">(used for rows without their own version)</span></label><input type="text" id="import-version-name" placeholder="e.g. SOR_June_2026"></div>
           <div class="field"><label>File</label><input type="file" id="import-sor-file" accept=".xlsx,.xls,.csv"></div>
@@ -5472,7 +5520,7 @@ function renderRPSor(zone) {
       </div>
       <div class="table-wrap mt-2" style="max-height:480px; overflow-y:auto">
         <table>
-          <thead><tr><th>Item No.</th><th style="width:38%">Description</th><th>UOM</th><th class="num-cell">Rate</th><th>Section</th><th>Version</th></tr></thead>
+          <thead><tr><th>Item No.</th><th style="width:34%">Description</th><th>UOM</th><th class="num-cell">Rate</th><th>Section</th><th>Mat Group</th><th>Version</th></tr></thead>
           <tbody id="rp-sor-body"></tbody>
         </table>
       </div>
@@ -5554,8 +5602,9 @@ function renderRPSorTable() {
       <td>${escapeHtml(it.uom)}</td>
       <td class="num-cell">${fmtNum(it.rate)}</td>
       <td><span class="badge badge-neutral">${escapeHtml(sectionLabel(it.section))}</span></td>
+      <td class="text-xs text-muted">${escapeHtml(it.matGroup||'')}</td>
       <td class="text-xs text-muted">${escapeHtml(it.version)}</td>
-    </tr>`).join('') : `<tr><td colspan="6"><div class="empty-state"><div class="ic">🔍</div>No matching items.</div></td></tr>`;
+    </tr>`).join('') : `<tr><td colspan="7"><div class="empty-state"><div class="ic">🔍</div>No matching items.</div></td></tr>`;
   document.getElementById('rp-pagination').innerHTML = `
     <span class="text-sm text-muted">${all.length.toLocaleString('en-IN')} items · Page ${RP.page} of ${totalPages}</span>
     <div class="flex gap-2">
@@ -5569,13 +5618,13 @@ async function exportRatesExcel() {
   toast('Building Excel…', 'ok', 1800);
   const XLSXmod = await ensureSheetJS();
   const wb = XLSXmod.utils.book_new();
-  let sorRows = [['Item No.','Description','UOM','Rate','Section','Version']]
-    .concat(rpFilteredSorItems().map(it=>[it.item_no, it.description, it.uom, it.rate, it.section, it.version]));
-  sorRows = withMsetclTitleRow(sorRows, 6);
+  let sorRows = [['Item No.','Description','UOM','Rate','Section','Mat Group','Version']]
+    .concat(rpFilteredSorItems().map(it=>[it.item_no, it.description, it.uom, it.rate, it.section, it.matGroup||'', it.version]));
+  sorRows = withMsetclTitleRow(sorRows, 7);
   const wsSor = XLSXmod.utils.aoa_to_sheet(sorRows);
   applySmartColWidths(wsSor, sorRows);
-  applyRowStyles(wsSor, {1:'header'}, 6);
-  styleMsetclTitleRow(wsSor, 6);
+  applyRowStyles(wsSor, {1:'header'}, 7);
+  styleMsetclTitleRow(wsSor, 7);
   XLSXmod.utils.book_append_sheet(wb, wsSor, 'SOR Items');
   let nsRows = [['Item No.','Description','UOM','Rate','Section','Remarks']]
     .concat(ST.nonSorCache.map(it=>[it.item_no, it.description, it.uom, it.rate, it.section, it.remarks||'']));
@@ -7100,6 +7149,11 @@ function renderAdminUsers() {
   const zone = document.getElementById('admin-users-body');
   const users = ST.usersCache;
   zone.innerHTML = `
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-head"><h3>👁️ SOR Visibility</h3></div>
+      <p class="hint" style="margin:0 0 10px">A hidden SOR version disappears completely for every non-admin user — it won't appear when preparing an estimate, on the Rates page, or as a fallback match for a missing item. Existing estimates already saved against a hidden version are unaffected (their line items keep their own stored data). You (admin) always see every version.</p>
+      <div id="admin-sor-visibility-list" class="check-option-grid"></div>
+    </div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>ID</th><th>Name</th><th>Role</th><th>Status</th><th></th></tr></thead>
@@ -7130,6 +7184,31 @@ function renderAdminUsers() {
       </table>
     </div>
   `;
+}
+function renderAdminSorVisibility() {
+  const zone = document.getElementById('admin-sor-visibility-list');
+  if (!zone) return;
+  const hidden = ST.hiddenSorVersions || [];
+  if (!ST.sorVersions.length) {
+    zone.innerHTML = `<p class="text-sm text-muted">No SOR versions uploaded yet.</p>`;
+    return;
+  }
+  zone.innerHTML = [...ST.sorVersions].sort((a,b)=>versionSortKey(b)-versionSortKey(a)).map(v => `
+    <label class="check-option ${!hidden.includes(v)?'checked':''}" data-version="${escapeHtml(v)}">
+      <input type="checkbox" ${!hidden.includes(v)?'checked':''} onchange="toggleSorVisibility('${escapeHtml(v)}', this.checked)">
+      <span class="opt-label">${escapeHtml(v)}${ST.sorCodes&&ST.sorCodes[v]?` — code ${escapeHtml(ST.sorCodes[v])}`:''}</span>
+      <span class="opt-count">${(ST.sorVersionCounts[v]||0).toLocaleString('en-IN')}</span>
+    </label>`).join('');
+}
+async function toggleSorVisibility(version, visible) {
+  const prevHidden = ST.hiddenSorVersions || [];
+  const nextHidden = visible ? prevHidden.filter(v=>v!==version) : [...new Set([...prevHidden, version])];
+  ST.hiddenSorVersions = nextHidden; // optimistic
+  try {
+    const res = await apiPost({action:'setHiddenSorVersions', versions: nextHidden, actingRole: ST.user.role});
+    if (!res.ok) { ST.hiddenSorVersions = prevHidden; renderAdminSorVisibility(); toast(res.error||'Failed to update visibility', 'err'); return; }
+    toast(`${version} is now ${visible?'visible':'hidden'} for users.`, 'ok');
+  } catch(e) { ST.hiddenSorVersions = prevHidden; renderAdminSorVisibility(); toast(e.message||'Failed to update visibility', 'err'); }
 }
 async function changeUserRole(id, role) {
   try {
@@ -7793,7 +7872,7 @@ function renderAicChat() {
 // ── Build compact catalog excerpts for the prompt — capped so the request
 // stays small and fast. Prefers items from the latest SOR version. ──
 function buildCatalogExcerpts() {
-  const latest = resolveLatestVersion(ST.sorVersions);
+  const latest = resolveLatestVersion(visibleSorVersions());
   const sorItems = ST.sorCache.filter(it => !latest || it.version === latest).slice(0, 1200);
   const sorExcerpt = sorItems.map(it => `${it.item_no} | ${it.description} | ${it.uom} | ${it.rate} | ${it.section}`).join('\n');
   const nonSorExcerpt = ST.nonSorCache.slice(0, 400).map(it => `${it.item_no} | ${it.description} | ${it.uom} | ${it.rate} | ${it.section}`).join('\n');
@@ -8027,14 +8106,10 @@ async function aicZestUpload(evt){
         const price = Number(it.exworks)||0;
         const useLatest = (price===1 || price===0);
         let desc=it.desc||it.full, uom=it.uom, section=sec, source='sor', rate=price, remark='';
-        const sor = ST.sorCache.find(s=>String(s.item_no)===String(it.matNo) && s.version===latest)
-                 || ST.sorCache.find(s=>String(s.item_no)===String(it.matNo));
-        if (sor) { desc=sor.description||desc; uom=sor.uom||uom; section=sor.section||sec; rate=useLatest?(sor.rate||0):price; }
-        else {
-          const ns = ST.nonSorCache.find(n=>String(n.item_no)===String(it.matNo));
-          if (ns) { source='nonsor'; desc=ns.description||desc; uom=ns.uom||uom; section=ns.section||sec; rate=useLatest?(ns.rate||0):price; }
-          else { source='estimated'; remark='Not in SOR/Non-SOR catalog — a Non-SOR entry may be needed'; missing++; }
-        }
+        const match = findCatalogMatch(String(it.matNo), latest);
+        if (match && match.source==='sor') { desc=match.description||desc; uom=match.uom||uom; section=match.section||sec; rate=useLatest?(match.rate||0):price; }
+        else if (match && match.source==='nonsor') { source='nonsor'; desc=match.description||desc; uom=match.uom||uom; section=match.section||sec; rate=useLatest?(match.rate||0):price; }
+        else { source='estimated'; remark='Not in SOR/Non-SOR catalog — a Non-SOR entry may be needed'; missing++; }
         // Catalog descriptions stay authoritative; the ZEST03 full description
         // is carried alongside them, never merged into the short description.
         const fullDesc = String(it.desc||'').trim() ? String(it.full||'') : '';
@@ -8237,16 +8312,12 @@ async function dbUploadHandler(evt){
       const priceRaw = ci.price>=0 ? parseFloat(row[ci.price]) : NaN;
       const price = isNaN(priceRaw) ? 0 : priceRaw;
       const useLatest = (price===1 || price===0);                        // blank/Re1 ⇒ latest SOR rate
-      // Catalog lookup (SOR first, then Non-SOR)
+      // Catalog lookup: selected/base version → Non-SOR → older SOR versions.
       let desc='', uom='', section='', source='estimated', rate=price, remark='';
-      const sor = ST.sorCache.find(s=>String(s.item_no)===matNo && s.version===latest) || ST.sorCache.find(s=>String(s.item_no)===matNo);
-      if (sor) { desc=sor.description; uom=sor.uom; section=sor.section; source='sor'; rate=useLatest?(sor.rate||0):price; }
-      else {
-        const ns = ST.nonSorCache.find(n=>String(n.item_no)===matNo);
-        if (ns) { desc=ns.description; uom=ns.uom; section=ns.section; source='nonsor'; rate=useLatest?(ns.rate||0):price; }
-      }
+      const match = findCatalogMatch(matNo, latest);
+      if (match) { desc=match.description; uom=match.uom; section=match.section; source=match.source; rate=useLatest?(match.rate||0):price; }
       // User-entered fields take precedence; catalog fills the gaps; classify last.
-      const inCatalog = !!sor || !!ST.nonSorCache.find(n=>String(n.item_no)===matNo);
+      const inCatalog = !!match;
       const finalSource = inCatalog ? source : (uSrc ? (/non/i.test(uSrc)?'nonsor':'sor') : 'estimated');
       // For items ALREADY in the catalog, the stored Description / UoM / Section /
       // Rate are authoritative and are NEVER overwritten by sheet entries. User
