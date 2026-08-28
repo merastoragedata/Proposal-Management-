@@ -7373,10 +7373,8 @@ async function renderAdminAi() {
   const zone = document.getElementById('admin-ai-body');
   zone.innerHTML = `<div class="flex items-center justify-center" style="padding:20px"><span class="spinner dark"></span></div>`;
   try {
-    const results = await Promise.all([api('getAnthropicApiKeyStatus'), api('getAiAllowedUsers')]);
-    const statusRes = results[0], allowedRes = results[1];
+    const statusRes = await api('getAnthropicApiKeyStatus');
     const configured = statusRes.ok && statusRes.configured;
-    const allowedUsers = allowedRes.ok ? (allowedRes.users||[]) : [];
     zone.innerHTML = `
       <div class="lock-banner" style="background:var(--info-100); color:var(--info-500)">
         ℹ️ AI Estimate Creator works for free out of the box using local keyword matching — no API key needed. Adding a paid Anthropic API key below upgrades it to real natural-language understanding, at your organization's cost. This is entirely optional.
@@ -7406,17 +7404,7 @@ async function renderAdminAi() {
       </div>
       <div id="ai-backend-check-result" class="mt-1"></div>
       <div class="divider"></div>
-      <h4 class="text-sm fw-700 mb-1" style="margin-bottom:10px">Approved Users</h4>
-      <div class="check-option-grid" id="ai-users-list">
-        ${ST.usersCache.filter(u=>u.role!=='admin').map(u=>`
-          <label class="check-option ${allowedUsers.includes(u.id)?'checked':''}">
-            <input type="checkbox" value="${escapeHtml(u.id)}" ${allowedUsers.includes(u.id)?'checked':''} onchange="this.closest('.check-option').classList.toggle('checked', this.checked)">
-            <span class="opt-label">${escapeHtml(u.name)} <span class="text-xs text-muted">(${escapeHtml(u.id)})</span></span>
-          </label>
-        `).join('') || '<p class="text-sm text-muted">No non-admin users yet.</p>'}
-      </div>
-      <p class="hint mt-1">Admins always have access regardless of this list.</p>
-      <button class="btn btn-gold btn-sm mt-1" id="ai-users-save-btn" onclick="saveAiAllowedUsers()">Save Approved Users</button>
+      <p class="hint">✓ AI Estimate Creator is available to every user by default — there's no per-user approval list to manage.</p>
     `;
   } catch(e) {
     zone.innerHTML = `<p class="error-text">Failed to load: ${escapeHtml(e.message)}</p>`;
@@ -7466,14 +7454,6 @@ async function saveAiApiKey() {
     if (!res.ok) { toast(explainBackendError(res.error)||'Failed to save', 'err', 7000); return false; }
     renderAdminAi();
   }, 'API key saved.');
-}
-async function saveAiAllowedUsers() {
-  const checked = Array.from(document.querySelectorAll('#ai-users-list input[type=checkbox]:checked')).map(cb=>cb.value);
-  const btn = document.getElementById('ai-users-save-btn');
-  await withSaveStatus(btn, async () => {
-    const res = await apiPost({action:'setAiAllowedUsers', userIds: checked, actingRole: ST.user.role});
-    if (!res.ok) { toast(res.error||'Failed to save', 'err'); return false; }
-  }, 'Approved users updated.');
 }
 // ══════════════════════════════════════════════════════════════
 // ORDER BOOK PAGE (📚)
