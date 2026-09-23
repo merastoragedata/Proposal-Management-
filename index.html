@@ -8,7 +8,7 @@
 /* Build stamp. Check the live site is running this file:
    open the browser console (F12) — the build id is printed on load.
    It is also shown at the bottom-right of the login screen. */
-window.__BUILD = "2026-08-06-s";
+window.__BUILD = "2026-09-23-ai-open";
 document.addEventListener("DOMContentLoaded", function(){
   var el = document.createElement("div");
   el.id = "build-stamp";
@@ -873,7 +873,7 @@ function boltIcon(size=26) {
 const NAV_ITEMS = [
   {id:'dashboard', icon:'🏠', label:'Home'},
   {id:'orderbook', icon:'📚', label:'Order Book'},
-  {id:'ai-creator', icon:'✨', label:'AI Estimate Creator', aiOnly:true},
+  {id:'ai-creator', icon:'✨', label:'AI Estimate Creator'},
   {id:'smartfill', icon:'📥', label:'Sheet Smart-Fill'},
   {id:'rates', icon:'💰', label:'Rates'},
   {id:'final-estimate', icon:'📄', label:'Final Estimate'},
@@ -884,7 +884,7 @@ const NAV_ITEMS = [
 function renderAppShell() {
   const u = ST.user || {};                       // never assume a user is present
   const initials = String(u.name||u.id||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
-  const navList = NAV_ITEMS.filter(n=>(!n.adminOnly||isAdmin()) && (!n.aiOnly||ST.aiAllowed||isAdmin()));
+  const navList = NAV_ITEMS.filter(n=>(!n.adminOnly||isAdmin()));
   document.getElementById('app').innerHTML = `
     <div class="topbar">
       <div class="topbar-row1">
@@ -962,7 +962,7 @@ function navigateTo(page, params={}, fromPop=false) {
   switch(page) {
     case 'dashboard': renderDashboardPage(); break;
     case 'orderbook': renderOrderBookPage(); break;
-    case 'ai-creator': if (ST.aiAllowed || isAdmin()) renderAiCreatorPage(); else navigateTo('dashboard'); break;
+    case 'ai-creator': renderAiCreatorPage(); break;
     case 'smartfill': renderSmartFillPage(); break;
     case 'final-estimate': renderFinalEstimatePage(); break;
     case 'rates': renderRatesPage(); break;
@@ -1804,12 +1804,16 @@ function setRowHeight(ws, rowIdx, pts) {
 // the following 3 header lines (division/scope/estimation no.) centered
 // and bold but smaller. colCount must match the sheet's actual width so
 // the merge spans correctly regardless of how many columns the sheet has. ──
-// Row 0 = company name (37pt). Row 1 = sheet title (28pt). Both centred on a
-// light grey band. Rows 2-4 are the estimate detail lines, unchanged.
+// Row 0 = company name (20pt). Row 1 = sheet title / estimate name (20pt).
+// Both centred on a light grey band. Rows 2-4 are the estimate detail
+// lines, unchanged. Row heights below are computed automatically from
+// these font sizes by autoRowHeights, so shrinking the font here shrinks
+// the printed row height too — nothing else needs adjusting.
 const BANNER_ROWS = 5;
-function applyMsetclHeaderBanner(ws, colCount) {
+function applyMsetclHeaderBanner(ws, colCount, bannerRowCount) {
+  const rowCount = bannerRowCount || BANNER_ROWS;
   ws['!merges'] = ws['!merges'] || [];
-  for (let r = 0; r < BANNER_ROWS; r++) {
+  for (let r = 0; r < rowCount; r++) {
     _mergeRowAcross(ws, r, colCount);
     const addr = XLSX.utils.encode_cell({r, c:0});
     if (!ws[addr]) ws[addr] = {t:'s', v:''};
@@ -1817,13 +1821,13 @@ function applyMsetclHeaderBanner(ws, colCount) {
     ws[addr].s = {
       font: {
         name: EXPORT_FONT, bold: true,
-        italic: (r >= 2 && r <= 4),
-        sz: r === 0 ? 30 : (r === 1 ? 28 : 14),
+        italic: (r >= 2 && r <= rowCount-1),
+        sz: r === 0 ? 20 : (r === 1 ? 20 : 14),
         color: {rgb:'000000'},
       },
       fill: isBanner ? {patternType:'solid', fgColor:{rgb:'D9DDE3'}} : undefined,
       alignment: { horizontal: isBanner ? 'center' : 'left', vertical:'center', wrapText:true },
-      border: r === BANNER_ROWS-1 ? {bottom:{style:'thin',color:{rgb:'000000'}}} : undefined
+      border: r === rowCount-1 ? {bottom:{style:'thin',color:{rgb:'000000'}}} : undefined
     };
     // heights are computed by autoRowHeights (content-based, print-ready)
   }
@@ -1961,6 +1965,34 @@ function drawOuterBorder(ws){
 }
 // Estimate each row's height from its content so nothing is clipped when
 // printed (rows auto-size to content — required for a ready-to-print sheet).
+// Numeric cells whose formatted display text (₹ symbol, Indian-grouping
+// commas, decimals) would overflow their assigned column width get a
+// smaller font — down to a floor — and wrap-text, instead of visually
+// cropping / showing Excel's "###" for a column that's too narrow.
+function preventNumericCropping(ws, minSz) {
+  if (!ws['!ref']) return;
+  const range = window.XLSX.utils.decode_range(ws['!ref']);
+  const cols = ws['!cols'] || [];
+  const floor = minSz || 8;
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const ad = window.XLSX.utils.encode_cell({r, c});
+      const cell = ws[ad];
+      if (!cell || typeof cell.v !== 'number') continue;
+      const colW = (cols[c] && cols[c].wch) ? cols[c].wch : 8.43;
+      const fmt = cell.s && cell.s.numFmt;
+      const text = (fmt && /₹/.test(fmt)) ? ('₹'+fmtNum(cell.v)) : fmtNum(cell.v);
+      let sz = (cell.s && cell.s.font && cell.s.font.sz) || 11;
+      const fitsAt = (s)=> colW * (11 / s);
+      if (text.length <= fitsAt(sz)) continue;
+      while (sz > floor && text.length > fitsAt(sz)) sz -= 1;
+      cell.s = cell.s || {};
+      cell.s.font = Object.assign({}, cell.s.font, { sz });
+      cell.s.alignment = Object.assign({ vertical:'center', horizontal:'right' }, cell.s.alignment,
+        { wrapText: text.length > fitsAt(sz) });
+    }
+  }
+}
 function autoRowHeights(ws, defaultFontSz=12, mins){
   if (!ws['!ref']) return;
   const range = window.XLSX.utils.decode_range(ws['!ref']);
@@ -3001,8 +3033,9 @@ function normalizeLoadedEstimate(e) {
 
 function effectiveRates() {
   const r = {...ST.chargeRates, ...(ST.currentEstimate.settings||{})};
-  // For R&M works, Freight & Insurance defaults to 0% unless explicitly set.
-  if (ST.currentEstimate.estimateType === 'rm' &&
+  // For R&M and AMC works, Freight & Insurance on materials defaults to 0%
+  // unless explicitly overridden in this estimate's settings.
+  if ((ST.currentEstimate.estimateType === 'rm' || ST.currentEstimate.estimateType === 'amc') &&
       !(ST.currentEstimate.settings && ST.currentEstimate.settings.freightInsurance != null)) {
     r.freightInsurance = 0;
   }
@@ -4044,7 +4077,11 @@ async function exportEstimateExcel() {
   const wb = XLSXmod.utils.book_new();
 
   // Abstract sheet: header block + Sr.1-9 table
-  const abstractHeader = estimateHeaderRows(e, '', 'Abstract');
+  // Row 3 (the "Name of Location" line) is dropped here — it's blank on
+  // every estimate that doesn't set a division, and the Abstract tab reads
+  // better without an empty header line. Other sheets keep all 5 lines.
+  const abstractHeader = estimateHeaderRows(e, '', 'Abstract').filter((r,i)=> i!==2);
+  const ABS_BANNER_ROWS = abstractHeader.length;
   const abstractTable = abstractSheetRows(false);
   // Abstract laid out across the full 12 columns (Sr in A, PARTICULARS B:K,
   // AMOUNT in L) so it aligns with the section sheets, plus a signatory footer.
@@ -4111,7 +4148,7 @@ async function exportEstimateExcel() {
     const HAIR = {style:'hair', color:{rgb:'000000'}};
     const firstSigRow = aSig.titleRowIdx - 2;
     const lastRow = XLSXmod.utils.decode_range(abs['!ref']).e.r;
-    for (let r = BANNER_ROWS; r <= lastRow; r++) {
+    for (let r = ABS_BANNER_ROWS; r <= lastRow; r++) {
       if (r >= firstSigRow) continue;      // signing area stays clean
       for (let c = 0; c < A_COLS; c++) {
         const ad = XLSXmod.utils.encode_cell({r, c});
@@ -4122,12 +4159,20 @@ async function exportEstimateExcel() {
     }
   })();
 
-  applyMsetclHeaderBanner(abs, A_COLS);
-  const absMins = {0:42, 1:39, 2:26.2, 3:40.5, 4:26.2, 5:28.5};
+  applyMsetclHeaderBanner(abs, A_COLS, ABS_BANNER_ROWS);
+  // Row-height floors, reindexed now that the blank division line (old
+  // index 2) is gone: row 0/1 (company/title) get no floor — at the
+  // reduced 20pt font, autoRowHeights' own content-based height is already
+  // right-sized, so pinning a floor here would just undo the shrink.
+  const absMins = {};
+  absMins[2] = 40.5;   // SCOPE OF WORK line
+  absMins[3] = 26.2;   // Estimation Number / SOR / Date line
+  absMins[titleIdx] = 28.5;   // "ABSTRACT" section-title row
   absMins[colHdrIdx] = 28.5;
   absMins[aSig.titleRowIdx] = 42; absMins[aSig.officeRowIdx] = 42;
   absMins[aSig.titleRowIdx-2] = 30; absMins[aSig.titleRowIdx-1] = 30;   // two rows above signatories, 1.5x
   abs['!freeze'] = { xSplit:0, ySplit:colHdrIdx+1, topLeftCell:XLSXmod.utils.encode_cell({r:colHdrIdx+1,c:0}), activePane:'bottomLeft', state:'frozen' };
+  preventNumericCropping(abs);
   autoRowHeights(abs, 12, absMins);
   XLSXmod.utils.book_append_sheet(wb, abs, 'Abstract');
 
@@ -4228,8 +4273,10 @@ async function exportEstimateExcel() {
     for (let i=itemStart;i<=itemEnd;i++){
       if ((i-itemStart)%2===1) for (let c=0;c<N;c++){ const ad=XLSXmod.utils.encode_cell({r:i,c}); if(ws[ad]){ ws[ad].s=ws[ad].s||{}; ws[ad].s.fill={patternType:'solid',fgColor:{rgb:'F4F7FC'}}; } }
       // Non-SOR rows carry a light yellow fill inside the Supply / O&M sheets,
-      // to separate them from SOR rows. A dedicated Non-SOR sheet is entirely
-      // Non-SOR, so highlighting every row there would mean nothing.
+      // to separate them from SOR rows. The dedicated Non-SOR Materials /
+      // Non-SOR Services sheets are entirely Non-SOR, so highlighting every
+      // row there would mean nothing — yellow stays confined to the mixed
+      // sheets, where it actually distinguishes something.
       if (!def.noHighlight &&
           String(ws[XLSXmod.utils.encode_cell({r:i,c:statusCol})] &&
                  ws[XLSXmod.utils.encode_cell({r:i,c:statusCol})].v || '') === 'Non-SoR') {
@@ -4345,8 +4392,7 @@ async function exportEstimateExcel() {
       // Description base width is 42. With ZEST03's Full Description present,
       // Description drops to 80% (33.6) and Full Description takes 150% (63).
       if(/full\s*description/.test(head)) col.wch = 63;                             // 150% of 42
-      else if(/description/.test(head)) col.wch = fullCol>-1 ? 33.6                 // 80% of 42
-                                               : Math.max(col.wch||20,42);         // wide, wraps → taller rows
+      else if(/description/.test(head)) col.wch = (fullCol>-1 ? 33.6 : 42) * 0.75; // reduced to 75% of its prior width
       if(/sor status|status/.test(head)) col.wch=Math.max(col.wch||10,12);
     });
 
@@ -4358,6 +4404,7 @@ async function exportEstimateExcel() {
     secMins[_sig.titleRowIdx-2]=30; secMins[_sig.titleRowIdx-1]=30;   // two rows above signatories, 1.5x
     ws['!rows'] = ws['!rows'] || [];
     calcHiddenRows.forEach(r=>{ ws['!rows'][r] = Object.assign({}, ws['!rows'][r], { hidden:true, level:1 }); });
+    preventNumericCropping(ws);
     autoRowHeights(ws, 14, secMins);
     calcHiddenRows.forEach(r=>{ ws['!rows'][r] = Object.assign({}, ws['!rows'][r], { hidden:true, level:1 }); });
     XLSXmod.utils.book_append_sheet(wb, ws, sanitizeSheetName(name));
@@ -8554,7 +8601,9 @@ async function exportSmartFillPDF() {
 // ════════════════════════════════════════════════════════════════════════
 const FE = {
   parsed:null, result:null,
-  estimateType:'project', acSupply:true, acProject:true, supplySpares:false,
+  // Additional Charge starts OFF for both — it must never apply unless the
+  // user explicitly checks the AC boxes below.
+  estimateType:'project', acSupply:false, acProject:false, supplySpares:false,
   trLine:false, landCompPct:15, division:'',
 };
 
