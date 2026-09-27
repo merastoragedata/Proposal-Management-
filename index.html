@@ -8,7 +8,7 @@
 /* Build stamp. Check the live site is running this file:
    open the browser console (F12) — the build id is printed on load.
    It is also shown at the bottom-right of the login screen. */
-window.__BUILD = "2026-09-23-ai-open";
+window.__BUILD = "2026-09-27-work-orders";
 document.addEventListener("DOMContentLoaded", function(){
   var el = document.createElement("div");
   el.id = "build-stamp";
@@ -451,6 +451,16 @@ function compressImageFile(file, quality=0.5, maxDim=1600) {
     reader.readAsDataURL(file);
   });
 }
+// Generic file → base64 reader (no image recompression) — used for Work
+// Order uploads, which are typically scanned PDFs rather than photos.
+function readFileAsBase64Raw(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read the file'));
+    reader.onload = () => resolve({base64: reader.result.split(',')[1], mimeType: file.type || 'application/octet-stream'});
+    reader.readAsDataURL(file);
+  });
+}
 // ══════════════════════════════════════════════════════════════
 // AUTH & BOOT
 // ══════════════════════════════════════════════════════════════
@@ -633,6 +643,10 @@ async function enterApp(preloadedBoot) {
     ST.printAllowed = !!boot.printAllowed;
     ST.aiKeyConfigured = !!boot.aiKeyConfigured;
     if (isAdmin() && boot.users) ST.usersCache = boot.users;
+    ST.woFieldDefs = boot.woFieldDefs || [];
+    ST.woAllowed = !!boot.woAllowed;
+    ST.workOrdersCache = boot.workOrders || [];
+    if (isAdmin() && boot.woRestrictedUsers) ST.woRestrictedUsers = boot.woRestrictedUsers;
 
     // Show the dashboard immediately after the single bootstrap round trip.
     // SOR items (only needed by Add Items / Final Estimate) load in the
@@ -687,6 +701,16 @@ async function ensureTcpLoaded() {
     if (t.ok) ST.tcodesCache = t.items || [];
     if (p.ok) ST.processesCache = p.items || [];
     ST._tcpLoaded = true;
+  } catch(e){}
+  return true;
+}
+// Work Orders — only the Work Orders page uses these.
+async function ensureWoLoaded() {
+  if (!ST.liteBoot || ST._woLoaded) return true;
+  try {
+    const r = await api('getWorkOrders');
+    if (r.ok) ST.workOrdersCache = r.workOrders || [];
+    ST._woLoaded = true;
   } catch(e){}
   return true;
 }
@@ -878,6 +902,7 @@ const NAV_ITEMS = [
   {id:'rates', icon:'💰', label:'Rates'},
   {id:'final-estimate', icon:'📄', label:'Final Estimate'},
   {id:'tcodes', icon:'🔖', label:'T Code / Processes'},
+  {id:'work-orders', icon:'📑', label:'Work Orders'},
   {id:'admin', icon:'⚙️', label:'Admin Panel', adminOnly:true},
 ];
 
@@ -967,6 +992,7 @@ function navigateTo(page, params={}, fromPop=false) {
     case 'final-estimate': renderFinalEstimatePage(); break;
     case 'rates': renderRatesPage(); break;
     case 'tcodes': renderTCodesPage(); break;
+    case 'work-orders': renderWorkOrdersPage(); break;
     case 'admin': if (isAdmin()) renderAdminPage(); else navigateTo('dashboard'); break;
     case 'estimate-new': renderEstimateStep1(!!params.preserveItems); break;
     case 'estimate-edit': renderEstimateWorkspace(params.id); break;
@@ -9236,6 +9262,669 @@ async function feDownloadRawZest(){
   } catch(err){ console.error(err); toast('Download failed: '+(err.message||'error'),'err',6000); }
 }
 
+
+// ══════════════════════════════════════════════════════════════
+// WORK ORDERS — Own Division / Circle Office / Zone Office / HO
+// register, with per-bill "Bill Certificate" sub-record.
+// ══════════════════════════════════════════════════════════════
+const WO_LEVELS = ['Own Division','Circle Office','Zone Office','HO'];
+const WO_LEVEL_COLOR = {'Own Division':'#1d4ed8','Circle Office':'#7c3aed','Zone Office':'#b45309','HO':'#0f766e'};
+let WO = { level:'All', search:'', openId:null };
+
+function canWoEdit(){ return !!(ST.woAllowed || isAdmin()); }
+function woList(){ return ST.workOrdersCache || []; }
+function woById(id){ return woList().find(w=>w.id===id); }
+function woFieldLabel(key){ const d=(ST.woFieldDefs||[]).find(f=>f.key===key); return d?d.label:key; }
+function woIdentityText(w){
+  const parts = (ST.woFieldDefs||[]).map(f=>(w.fields||{})[f.key]).filter(Boolean);
+  return (w.title ? w.title+' — ' : '') + (parts.join(' · ') || '(no fields filled)');
+}
+
+function renderWorkOrdersPage(){
+  if (ST.liteBoot && !ST._woLoaded){
+    showPageLoading('Loading Work Orders');
+    ensureWoLoaded().then(()=> renderWorkOrdersPage());
+    return;
+  }
+  const main = document.getElementById('main-content');
+  const actionButtons = `<button class="btn btn-ghost" onclick="navigateTo('dashboard')">🏠 Home</button>`;
+  main.innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">📑 Work Orders</h1><p class="page-sub">Own Division · Circle Office · Zone Office · HO — WO details, bills &amp; running balance</p></div>
+      <div class="flex gap-2" style="flex-wrap:wrap">
+        ${canWoEdit()?`<button class="btn btn-gold btn-sm" onclick="openWoModal()">+ New Work Order</button>`:''}
+        <button class="btn btn-ghost btn-sm" onclick="openWoFieldsModal()">⚙ Manage Fields</button>
+        ${isAdmin()?`<button class="btn btn-ghost btn-sm" onclick="openWoAccessModal()">🔒 Manage Access</button>`:''}
+        ${actionButtons}
+      </div>
+    </div>
+    ${!canWoEdit()?`<p class="hint" style="margin-bottom:10px">You have view-only access to Work Orders. Ask an admin if you need to create or edit them.</p>`:''}
+    <div class="tabs" id="wo-level-tabs">
+      ${['All'].concat(WO_LEVELS).map(l=>`<div class="tab${WO.level===l?' active':''}" onclick="setWoLevel('${l}')">${l}${l!=='All'?` <span class="badge badge-neutral">${woList().filter(w=>w.level===l).length}</span>`:''}</div>`).join('')}
+    </div>
+    <input type="text" id="wo-search" placeholder="Search WO / PO / field values…" value="${escapeHtml(WO.search||'')}" oninput="onWoSearch(this.value)" style="margin-bottom:12px">
+    <div id="wo-list"></div>
+    ${bottomActionBar(actionButtons)}
+  `;
+  renderWoListZone();
+}
+function setWoLevel(l){ WO.level=l; document.querySelectorAll('#wo-level-tabs .tab').forEach((el,i)=>el.classList.toggle('active', ['All'].concat(WO_LEVELS)[i]===l)); renderWoListZone(); }
+let _woSearchT=null;
+function onWoSearch(v){ WO.search=v; clearTimeout(_woSearchT); _woSearchT=setTimeout(()=>{ const el=document.getElementById('wo-search'); const caret=el?el.selectionStart:null; renderWoListZone(); const ni=document.getElementById('wo-search'); if(ni){ni.focus(); if(caret!=null){try{ni.setSelectionRange(caret,caret);}catch(e){}}}}, 150); }
+
+function woFilteredList(){
+  let list = woList();
+  if (WO.level!=='All') list = list.filter(w=>w.level===WO.level);
+  const q=(WO.search||'').toLowerCase();
+  if (q) list = list.filter(w=>{
+    const inFields = Object.values(w.fields||{}).some(v=>String(v||'').toLowerCase().includes(q));
+    return inFields || (w.title||'').toLowerCase().includes(q) || (w.remarks||'').toLowerCase().includes(q);
+  });
+  return list;
+}
+function renderWoListZone(){
+  const zone = document.getElementById('wo-list');
+  const list = woFilteredList();
+  if (!list.length){ zone.innerHTML = `<div class="empty-state"><div class="ic">📑</div>${WO.search||WO.level!=='All'?'No Work Orders match.':'No Work Orders yet.'}</div>`; return; }
+  zone.innerHTML = list.map(w=>{
+    const pct = w.woAmount>0 ? Math.min(100, Math.round((w.billTotal/w.woAmount)*100)) : 0;
+    const remColor = w.remaining<0 ? '#dc2626' : (w.woAmount>0 && pct>=90 ? '#b45309' : '#15803d');
+    return `
+    <div class="card" style="margin-bottom:12px; cursor:pointer" onclick="openWoDetail('${w.id}')">
+      <div class="flex gap-2" style="justify-content:space-between; align-items:flex-start; flex-wrap:wrap">
+        <div>
+          <span class="badge" style="background:${WO_LEVEL_COLOR[w.level]||'#555'}; color:#fff">${escapeHtml(w.level)}</span>
+          <div class="fw-700" style="margin-top:6px">${escapeHtml(woIdentityText(w))}</div>
+          <div class="text-xs text-muted mt-1">${w.bills.length} bill${w.bills.length!==1?'s':''} · Owner: ${escapeHtml(w.ownerName||w.ownerId)}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="text-xs text-muted">WO Amount</div>
+          <div class="fw-700 mono">${fmtINR(w.woAmount)}</div>
+          <div class="text-xs" style="color:${remColor}; font-weight:700">Balance: ${fmtINR(w.remaining)}</div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Field manager: rename / add / remove the shared WO field list ──
+function openWoFieldsModal(){
+  const defs = ST.woFieldDefs||[];
+  openModal(`
+    <div class="modal-head"><h3>Manage Work Order Fields</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <p class="hint">These fields appear on every Work Order. Anyone can rename, add, or remove them.</p>
+    <div id="wo-fields-list">${defs.map((d,i)=>`
+      <div class="flex gap-2" style="margin-bottom:8px; align-items:center" data-fkey="${escapeHtml(d.key)}">
+        <input type="text" class="wo-field-label" value="${escapeHtml(d.label)}" style="flex:1">
+        <button class="btn btn-danger btn-sm" onclick="this.closest('[data-fkey]').remove()">✕</button>
+      </div>`).join('')}</div>
+    <button class="btn btn-ghost btn-sm" onclick="addWoFieldRow()">+ Add Field</button>
+    <div id="wo-fields-error" class="error-text" style="display:none"></div>
+    <button class="btn btn-gold btn-block mt-2" onclick="submitWoFieldDefs()">Save Fields</button>
+  `);
+}
+function addWoFieldRow(){
+  const list = document.getElementById('wo-fields-list');
+  const row = document.createElement('div');
+  row.className='flex gap-2'; row.style.cssText='margin-bottom:8px; align-items:center';
+  row.setAttribute('data-fkey','');
+  row.innerHTML = `<input type="text" class="wo-field-label" placeholder="New field name" style="flex:1">
+    <button class="btn btn-danger btn-sm" onclick="this.closest('[data-fkey]').remove()">✕</button>`;
+  list.appendChild(row);
+}
+async function submitWoFieldDefs(){
+  const rows = Array.from(document.querySelectorAll('#wo-fields-list [data-fkey]'));
+  const defs = rows.map(r=>({ key:r.dataset.fkey||'', label:r.querySelector('.wo-field-label').value.trim() })).filter(d=>d.label);
+  const err = document.getElementById('wo-fields-error');
+  if (!defs.length){ err.textContent='Add at least one field.'; err.style.display='block'; return; }
+  const res = await apiPost({action:'saveWoFieldDefs', defs});
+  if (!res.ok){ err.textContent=res.error||'Failed.'; err.style.display='block'; return; }
+  ST.woFieldDefs = res.defs || defs;
+  closeModal(); toast('Fields updated.','ok');
+  if (ST.currentPage==='work-orders') renderWorkOrdersPage();
+}
+
+// ── Admin: restrict specific users to view-only ──
+function openWoAccessModal(){
+  if (!isAdmin()) return;
+  const restricted = new Set(ST.woRestrictedUsers||[]);
+  const users = (ST.usersCache||[]).filter(u=>u.id!=='admin');
+  openModal(`
+    <div class="modal-head"><h3>Work Orders — Manage Access</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <p class="hint">Everyone can create/edit Work Orders by default. Check a user to make them view-only.</p>
+    <div style="max-height:320px; overflow-y:auto">
+      ${users.map(u=>`<label class="flex gap-2" style="align-items:center; padding:6px 0">
+        <input type="checkbox" class="wo-restrict-cb" value="${escapeHtml(u.id)}" ${restricted.has(u.id)?'checked':''}>
+        <span>${escapeHtml(u.name||u.id)} <span class="text-xs text-muted">(${escapeHtml(u.id)})</span></span>
+      </label>`).join('') || '<p class="text-muted text-sm">No other users yet.</p>'}
+    </div>
+    <button class="btn btn-gold btn-block mt-2" onclick="submitWoAccess()">Save</button>
+  `);
+}
+async function submitWoAccess(){
+  const ids = Array.from(document.querySelectorAll('.wo-restrict-cb:checked')).map(el=>el.value);
+  const res = await apiPost({action:'setWoRestrictedUsers', userIds:ids, actingRole:ST.user.role});
+  if (!res.ok){ toast(res.error||'Failed.','err'); return; }
+  ST.woRestrictedUsers = ids;
+  closeModal(); toast('Access updated.','ok');
+}
+
+// ── Create / Edit Work Order ──
+function openWoModal(id=null){
+  const w = id ? woById(id) : null;
+  const defs = ST.woFieldDefs||[];
+  openModal(`
+    <div class="modal-head"><h3>${w?'Edit':'New'} Work Order</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="field"><label>Level</label>
+      <select id="wo-level">${WO_LEVELS.map(l=>`<option value="${l}" ${w&&w.level===l?'selected':''}>${l}</option>`).join('')}</select>
+    </div>
+    <div class="field"><label>Work / Description (optional, helps you find it in the list)</label>
+      <input type="text" id="wo-title" value="${w?escapeHtml(w.title||''):''}"></div>
+    ${defs.map(d=>`<div class="field"><label>${escapeHtml(d.label)}</label>
+      <input type="text" class="wo-field-input" data-key="${escapeHtml(d.key)}" value="${w?escapeHtml((w.fields||{})[d.key]||''):''}"></div>`).join('')}
+    <div class="field"><label>Work Order Amount (₹)</label>
+      <input type="number" id="wo-amount" step="0.01" value="${w?w.woAmount:''}"></div>
+    <div class="field"><label>Remarks</label><textarea id="wo-remarks">${w?escapeHtml(w.remarks||''):''}</textarea></div>
+    <div class="field"><label>Attach Work Order Document</label>
+      ${w&&w.fileUrl?`<div class="flex gap-2" style="margin-bottom:6px"><a class="btn btn-ghost btn-sm" href="${w.fileUrl}" target="_blank" rel="noopener">📎 ${escapeHtml(w.fileName||'View file')}</a></div>`:''}
+      <input type="file" id="wo-file-input" ${w?'':'disabled'}>
+      ${w?'':'<p class="hint">Save the Work Order first, then upload its document from the detail view.</p>'}
+    </div>
+    <div id="wo-error" class="error-text" style="display:none"></div>
+    <button class="btn btn-gold btn-block mt-1" id="wo-submit-btn" onclick="submitWoModal(${w?`'${id}'`:'null'})">${w?'Save Changes':'Create Work Order'}</button>
+  `);
+}
+async function submitWoModal(id){
+  const level = document.getElementById('wo-level').value;
+  const title = document.getElementById('wo-title').value.trim();
+  const woAmount = parseFloat(document.getElementById('wo-amount').value)||0;
+  const remarks = document.getElementById('wo-remarks').value.trim();
+  const fields = {};
+  document.querySelectorAll('.wo-field-input').forEach(el=> fields[el.dataset.key]=el.value.trim());
+  const err = document.getElementById('wo-error'); err.style.display='none';
+  const btn = document.getElementById('wo-submit-btn');
+  const payload = { id: id||undefined, level, title, fields, woAmount, remarks, ownerName: ST.user.name||ST.user.id };
+  await withSaveStatus(btn, async ()=>{
+    const res = await apiPost({action:'saveWorkOrder', workOrder:payload, userId:ST.user.id, role:ST.user.role});
+    if (!res.ok){ err.textContent=res.error||'Failed.'; err.style.display='block'; return false; }
+    await refreshWorkOrders();
+    closeModal();
+    if (ST.currentPage==='work-orders') renderWorkOrdersPage();
+    if (!id) openWoDetail(res.id);
+  }, id?'Work order updated.':'Work order created.');
+}
+async function refreshWorkOrders(){
+  const r = await api('getWorkOrders');
+  if (r.ok) ST.workOrdersCache = r.workOrders||[];
+}
+function deleteWoConfirm(id){
+  openModal(`
+    <div class="modal-head"><h3>Delete Work Order?</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <p class="text-sm">This deletes the Work Order and every bill recorded against it. This cannot be undone.</p>
+    <div class="flex gap-2 justify-end mt-2">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="confirmDeleteWo('${id}')">Delete</button>
+    </div>`);
+}
+async function confirmDeleteWo(id){
+  const res = await apiPost({action:'deleteWorkOrder', id, userId:ST.user.id, role:ST.user.role});
+  if (!res.ok){ toast(res.error||'Delete failed','err'); return; }
+  await refreshWorkOrders();
+  closeModal(); toast('Work Order deleted.','ok');
+  navigateTo('work-orders');
+}
+async function onWoFileSelected(evt, woId){
+  const file = evt.target.files[0]; evt.target.value='';
+  if (!file) return;
+  toast('Uploading…','ok',1500);
+  try {
+    const isImg = /^image\//.test(file.type);
+    const data = isImg ? await compressImageFile(file, 0.6, 1600) : await readFileAsBase64Raw(file);
+    const res = await apiPost({action:'uploadWoFile', woId, fileName:file.name, mimeType:data.mimeType, base64Data:data.base64, userId:ST.user.id, role:ST.user.role});
+    if (!res.ok){ toast(res.error||'Upload failed.','err',6000); return; }
+    await refreshWorkOrders();
+    toast('File uploaded.','ok');
+    openWoDetail(woId);
+  } catch(e){ toast(e.message||'Upload failed.','err'); }
+}
+
+// ── Work Order detail: fields, remaining-balance card, bills, docs default, downloads ──
+function openWoDetail(id){
+  WO.openId = id;
+  const w = woById(id);
+  if (!w){ toast('Work order not found — it may have been deleted.','err'); return; }
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="page-head">
+      <div><h1 class="page-title">📑 ${escapeHtml(w.title||'Work Order')}</h1>
+        <p class="page-sub"><span class="badge" style="background:${WO_LEVEL_COLOR[w.level]}; color:#fff">${escapeHtml(w.level)}</span></p></div>
+      <div class="flex gap-2" style="flex-wrap:wrap">
+        ${canWoEdit()?`<button class="btn btn-ghost btn-sm" onclick="openWoModal('${w.id}')">✎ Edit</button>`:''}
+        ${canWoEdit()?`<button class="btn btn-danger btn-sm" onclick="deleteWoConfirm('${w.id}')">Delete</button>`:''}
+        <button class="btn btn-ghost" onclick="navigateTo('work-orders')">← Back</button>
+      </div>
+    </div>
+    <div id="wo-detail-body"></div>
+  `;
+  renderWoDetailBody();
+}
+function renderWoDetailBody(){
+  const w = woById(WO.openId); if (!w) return;
+  const zone = document.getElementById('wo-detail-body');
+  const defs = ST.woFieldDefs||[];
+  const pct = w.woAmount>0 ? Math.min(100, Math.max(0, Math.round((w.billTotal/w.woAmount)*100))) : 0;
+  const over = w.remaining<0;
+  const balColor = over ? '#dc2626' : (pct>=90?'#b45309':'#15803d');
+  const balBg = over ? 'linear-gradient(135deg,#fee2e2,#fecaca)' : (pct>=90?'linear-gradient(135deg,#fef3c7,#fde68a)':'linear-gradient(135deg,#dcfce7,#bbf7d0)');
+  zone.innerHTML = `
+    <div class="card" style="margin-bottom:12px">
+      <h3>Work Order Details</h3>
+      <div class="table-wrap"><table>
+        <tbody>
+          ${defs.map(d=>`<tr><td class="fw-700" style="width:40%">${escapeHtml(d.label)}</td><td>${escapeHtml((w.fields||{})[d.key]||'—')}</td></tr>`).join('')}
+          <tr><td class="fw-700">Remarks</td><td>${escapeHtml(w.remarks||'—')}</td></tr>
+          <tr><td class="fw-700">Attached Document</td><td>${w.fileUrl?`<a href="${w.fileUrl}" target="_blank" rel="noopener">📎 ${escapeHtml(w.fileName||'View')}</a>`:'—'}
+            ${canWoEdit()?` <button class="btn btn-ghost btn-sm" onclick="document.getElementById('wo-file-input-detail').click()">${w.fileUrl?'Replace':'+ Upload'}</button>
+            <input type="file" id="wo-file-input-detail" style="display:none" onchange="onWoFileSelected(event,'${w.id}')">`:''}</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px; background:${balBg}">
+      <div class="flex gap-2" style="justify-content:space-between; flex-wrap:wrap; align-items:center">
+        <div><div class="text-xs" style="opacity:.75">Work Order Amount</div><div class="fw-700 mono" style="font-size:20px">${fmtINR(w.woAmount)}</div></div>
+        <div><div class="text-xs" style="opacity:.75">Billed So Far</div><div class="fw-700 mono" style="font-size:20px">${fmtINR(w.billTotal)}</div></div>
+        <div style="text-align:right"><div class="text-xs" style="opacity:.75">${over?'Overspent By':'Remaining Balance'}</div>
+          <div class="fw-700 mono" style="font-size:26px; color:${balColor}">${fmtINR(Math.abs(w.remaining))}</div></div>
+      </div>
+      <div style="height:8px; background:rgba(0,0,0,.08); border-radius:6px; margin-top:10px; overflow:hidden">
+        <div style="height:100%; width:${Math.min(100,pct)}%; background:${balColor}"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-head">
+        <h3>Bills <span class="badge badge-neutral">${w.bills.length}</span></h3>
+        <div class="flex gap-2" style="flex-wrap:wrap">
+          ${canWoEdit()?`<button class="btn btn-ghost btn-sm" onclick="openWoDocDefaultsModal('${w.id}')">📋 Default Documents</button>`:''}
+          ${canWoEdit()?`<button class="btn btn-gold btn-sm" onclick="openWoBillModal('${w.id}')">+ Add Bill</button>`:''}
+        </div>
+      </div>
+      ${w.bills.length? `<div class="table-wrap"><table>
+        <thead><tr><th>Bill No</th><th>Bill Date</th><th>PO No</th><th>PO Date</th><th>MIGO/SES</th><th>Amount</th><th>Other</th><th></th></tr></thead>
+        <tbody>${w.bills.map(b=>`<tr>
+          <td>${escapeHtml(b.billNo||'—')}</td><td>${escapeHtml(b.billDate||'—')}</td>
+          <td>${escapeHtml(b.poNo||'—')}</td><td>${escapeHtml(b.poDate||'—')}</td>
+          <td>${escapeHtml(b.migoSes||'—')}</td><td class="mono">${fmtINR(b.amount)}</td>
+          <td class="text-sm text-muted">${escapeHtml(b.otherDetails||'—')}</td>
+          <td class="flex gap-1" style="flex-wrap:wrap">
+            ${canWoEdit()?`<button class="btn btn-ghost btn-sm" onclick="openWoBillModal('${w.id}','${b.id}')">Edit</button>`:''}
+            ${canWoEdit()?`<button class="btn btn-danger btn-sm" onclick="deleteWoBillConfirm('${w.id}','${b.id}')">Del</button>`:''}
+          </td></tr>`).join('')}</tbody>
+      </table></div>` : `<div class="empty-state"><div class="ic">🧾</div>No bills recorded yet.</div>`}
+    </div>
+
+    <div class="card">
+      <h3>Download Statement</h3>
+      <p class="hint">Full Work Order details plus every bill recorded against it, including Bill Certificates.</p>
+      <div class="flex gap-2" style="flex-wrap:wrap">
+        <button class="btn btn-gold" onclick="exportWoExcel('${w.id}')">⬇ Excel</button>
+        <button class="btn btn-gold" onclick="exportWoPDF('${w.id}')">⬇ PDF</button>
+      </div>
+    </div>
+  `;
+}
+function deleteWoBillConfirm(woId, billId){
+  openModal(`
+    <div class="modal-head"><h3>Delete Bill?</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <p class="text-sm">This removes the bill entry and its certificate. This cannot be undone.</p>
+    <div class="flex gap-2 justify-end mt-2">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="confirmDeleteWoBill('${woId}','${billId}')">Delete</button>
+    </div>`);
+}
+async function confirmDeleteWoBill(woId, billId){
+  const res = await apiPost({action:'deleteWoBill', woId, billId, userId:ST.user.id, role:ST.user.role});
+  if (!res.ok){ toast(res.error||'Delete failed','err'); return; }
+  await refreshWorkOrders();
+  closeModal(); toast('Bill deleted.','ok');
+  if (WO.openId===woId) renderWoDetailBody();
+}
+
+// ── Document checklist master + presets, seeded from the 16 certificate
+// sheets supplied: a 7-item "Standard" set (supply/service works) and a
+// 1-item "Advertisement" set (media bills). Any WO can start from either
+// preset and then add/remove/rename documents freely. ──
+const WO_DOC_MASTER = [
+  {key:'insurance', label:'Comprehensive Insurance'},
+  {key:'guarantee', label:'Guarantee Certificate'},
+  {key:'challan', label:'Delivery Challan'},
+  {key:'jmc', label:'Joint Measurement Certificate'},
+  {key:'workreport', label:'Work Report / MOM'},
+  {key:'eway', label:'E-Way Bill / Transporting Bill'},
+  {key:'testcert', label:'Test Certificate / Quality Inspection Report'},
+  {key:'newspaper', label:'News Paper Ad'},
+];
+const WO_DOC_PRESETS = {
+  standard: {label:'Standard (Supply / Service Works)', keys:['insurance','guarantee','challan','jmc','workreport','eway','testcert']},
+  advertisement: {label:'Advertisement / Media', keys:['newspaper']},
+};
+function woDocLabel(key){ const m=WO_DOC_MASTER.find(d=>d.key===key); return m?m.label:key; }
+function woDefaultDocsFor(w){
+  if (w.docDefaults && w.docDefaults.length) return w.docDefaults.map(d=>({...d}));
+  return WO_DOC_PRESETS.standard.keys.map(k=>({key:k, label:woDocLabel(k)}));
+}
+
+// Manage a WO's own default document checklist (pre-fills new bill certificates).
+function openWoDocDefaultsModal(woId){
+  const w = woById(woId); if (!w) return;
+  const current = woDefaultDocsFor(w);
+  openModal(`
+    <div class="modal-head"><h3>Default Documents for this Work Order</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <p class="hint">Start from a preset, then edit freely. New Bill Certificates for this WO pre-fill with this list.</p>
+    <div class="field"><label>Start from preset</label>
+      <select id="wo-doc-preset" onchange="applyWoDocPreset(this.value)">
+        <option value="">— keep current —</option>
+        ${Object.keys(WO_DOC_PRESETS).map(k=>`<option value="${k}">${WO_DOC_PRESETS[k].label}</option>`).join('')}
+      </select>
+    </div>
+    <div id="wo-doc-default-list">${current.map(d=>`
+      <div class="flex gap-2" style="margin-bottom:6px; align-items:center" data-dkey="${escapeHtml(d.key)}">
+        <input type="text" class="wo-doc-label" value="${escapeHtml(d.label)}" style="flex:1">
+        <button class="btn btn-danger btn-sm" onclick="this.closest('[data-dkey]').remove()">✕</button>
+      </div>`).join('')}</div>
+    <button class="btn btn-ghost btn-sm" onclick="addWoDocDefaultRow()">+ Add Document</button>
+    <button class="btn btn-gold btn-block mt-2" onclick="submitWoDocDefaults('${woId}')">Save Defaults</button>
+  `);
+}
+function applyWoDocPreset(presetKey){
+  if (!presetKey) return;
+  const list = document.getElementById('wo-doc-default-list');
+  list.innerHTML = WO_DOC_PRESETS[presetKey].keys.map(k=>`
+    <div class="flex gap-2" style="margin-bottom:6px; align-items:center" data-dkey="${k}">
+      <input type="text" class="wo-doc-label" value="${escapeHtml(woDocLabel(k))}" style="flex:1">
+      <button class="btn btn-danger btn-sm" onclick="this.closest('[data-dkey]').remove()">✕</button>
+    </div>`).join('');
+}
+function addWoDocDefaultRow(){
+  const list = document.getElementById('wo-doc-default-list');
+  const row = document.createElement('div');
+  row.className='flex gap-2'; row.style.cssText='margin-bottom:6px; align-items:center';
+  row.setAttribute('data-dkey', uid('doc'));
+  row.innerHTML = `<input type="text" class="wo-doc-label" placeholder="Document name" style="flex:1">
+    <button class="btn btn-danger btn-sm" onclick="this.closest('[data-dkey]').remove()">✕</button>`;
+  list.appendChild(row);
+}
+async function submitWoDocDefaults(woId){
+  const rows = Array.from(document.querySelectorAll('#wo-doc-default-list [data-dkey]'));
+  const docDefaults = rows.map(r=>({ key:r.dataset.dkey, label:r.querySelector('.wo-doc-label').value.trim() })).filter(d=>d.label);
+  const w = woById(woId);
+  const res = await apiPost({action:'saveWorkOrder', workOrder:{id:woId, level:w.level, title:w.title, fields:w.fields, woAmount:w.woAmount, remarks:w.remarks, docDefaults}, userId:ST.user.id, role:ST.user.role});
+  if (!res.ok){ toast(res.error||'Failed.','err'); return; }
+  await refreshWorkOrders();
+  closeModal(); toast('Default documents saved.','ok');
+}
+
+// ── Bill entry modal, with a collapsed "Bill Certificate" section ──
+const WO_CERT_QUESTIONS = [
+  {key:'q1', text:'Whether work carried out satisfactorily as per terms and conditions and approved drawing & specification of the Work Order?'},
+  {key:'q2', text:'Whether material received in good condition as per Work Order'},
+  {key:'q3', text:'Rates are as per Work Order?'},
+  {key:'q4', text:'Is there any damage or loss of assets of MSETCL during execution of work?'},
+  {key:'q5', text:'Whether this bill is recorded / paid previously?'},
+  {key:'q6', text:'Whether T&P / manpower or any other material utilised belongs to MSETCL'},
+  {key:'q7', text:'Whether any penalty / other deduction from Bill? If Yes, amount', hasAmount:true},
+  {key:'q8', text:'Whether work completed satisfactorily within given time as per Work Order?'},
+];
+function emptyWoCertificate(w){
+  const docs = woDefaultDocsFor(w).map(d=>({key:d.key, label:d.label, selected:true, status:'NA'}));
+  const qa = {}; WO_CERT_QUESTIONS.forEach(q=> qa[q.key]={ans:'Yes', remarks:'', amount:''});
+  return {
+    vendorName:'', certBillNo:'', woNoOverride:(w.fields||{}).woNo||'', woDateOverride:(w.fields||{}).date||'',
+    poNoOverride:'', poDateOverride:'', btsNo:'', sesMigoOverride:'',
+    qa, workStart:'', workCompleted:'', siteHandoverFrom:'', siteHandoverTo:'',
+    outageFrom:'', outageTo:'', migoNo:'', serviceEntryNo:'', docs,
+  };
+}
+function openWoBillModal(woId, billId=null){
+  const w = woById(woId); if (!w) return;
+  const bill = billId ? w.bills.find(b=>b.id===billId) : null;
+  openModal(`
+    <div class="modal-head"><h3>${bill?'Edit':'Add'} Bill</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="field"><label>Bill No</label><input type="text" id="wb-billno" value="${bill?escapeHtml(bill.billNo||''):''}"></div>
+    <div class="field"><label>Bill Date</label><input type="date" id="wb-billdate" value="${bill?escapeHtml(bill.billDate||''):''}"></div>
+    <div class="field"><label>PO No (for this bill)</label><input type="text" id="wb-pono" value="${bill?escapeHtml(bill.poNo||''):''}"></div>
+    <div class="field"><label>PO Date</label><input type="date" id="wb-podate" value="${bill?escapeHtml(bill.poDate||''):''}"></div>
+    <div class="field"><label>MIGO / SES Details</label><input type="text" id="wb-migoses" value="${bill?escapeHtml(bill.migoSes||''):''}"></div>
+    <div class="field"><label>Bill Amount (₹)</label><input type="number" step="0.01" id="wb-amount" value="${bill?bill.amount:''}"></div>
+    <div class="field"><label>Other Details</label><textarea id="wb-other">${bill?escapeHtml(bill.otherDetails||''):''}</textarea></div>
+
+    <div class="collapse" id="wb-cert-collapse">
+      <div class="collapse-head" onclick="toggleCollapse(this)"><span class="fw-700 text-sm">📜 Bill Certificate</span><span class="chev">▸</span></div>
+      <div class="collapse-body"><div class="collapse-body-inner" id="wb-cert-zone"></div></div>
+    </div>
+
+    <div id="wb-error" class="error-text" style="display:none; margin-top:8px"></div>
+    <button class="btn btn-gold btn-block mt-2" id="wb-submit-btn" onclick="submitWoBillModal('${woId}',${bill?`'${billId}'`:'null'})">${bill?'Save Changes':'Add Bill'}</button>
+  `, true);
+  renderWoCertificateForm(w, bill);
+}
+function renderWoCertificateForm(w, bill){
+  const cert = (bill && bill.certificate) ? bill.certificate : emptyWoCertificate(w);
+  window.__woCertDraft = cert; // working copy, read back on submit
+  const zone = document.getElementById('wb-cert-zone');
+  zone.innerHTML = `
+    <div class="field"><label>Vendor Name</label><input type="text" id="wc-vendor" value="${escapeHtml(cert.vendorName||'')}"></div>
+    <div class="field"><label>Certificate for Bill No</label><input type="text" id="wc-billno" value="${escapeHtml(cert.certBillNo||(document.getElementById('wb-billno')||{}).value||'')}"></div>
+    <div class="grid-2">
+      <div class="field"><label>Work Order No</label><input type="text" id="wc-wono" value="${escapeHtml(cert.woNoOverride||'')}"></div>
+      <div class="field"><label>Work Order Date</label><input type="date" id="wc-wodate" value="${escapeHtml(cert.woDateOverride||'')}"></div>
+      <div class="field"><label>PO No</label><input type="text" id="wc-pono" value="${escapeHtml(cert.poNoOverride||(document.getElementById('wb-pono')||{}).value||'')}"></div>
+      <div class="field"><label>PO Date</label><input type="date" id="wc-podate" value="${escapeHtml(cert.poDateOverride||(document.getElementById('wb-podate')||{}).value||'')}"></div>
+      <div class="field"><label>BTS No.</label><input type="text" id="wc-bts" value="${escapeHtml(cert.btsNo||'')}"></div>
+      <div class="field"><label>SES / MIGO No.</label><input type="text" id="wc-sesmigo" value="${escapeHtml(cert.sesMigoOverride||(document.getElementById('wb-migoses')||{}).value||'')}"></div>
+    </div>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th style="width:6%">Sr.</th><th>Particulars</th><th style="width:16%">Answer</th><th style="width:22%">Remarks</th></tr></thead>
+      <tbody>${WO_CERT_QUESTIONS.map((q,i)=>{
+        const a = cert.qa[q.key]||{ans:'Yes',remarks:'',amount:''};
+        return `<tr>
+          <td class="mono text-muted">${i+1}</td>
+          <td>${escapeHtml(q.text)}${q.hasAmount?` <input type="text" id="wc-qamt-${q.key}" placeholder="Amount if Yes" value="${escapeHtml(a.amount||'')}" style="width:100%; margin-top:4px">`:''}</td>
+          <td><select id="wc-qans-${q.key}"><option ${a.ans==='Yes'?'selected':''}>Yes</option><option ${a.ans==='No'?'selected':''}>No</option><option ${a.ans==='NA'?'selected':''}>NA</option></select></td>
+          <td><input type="text" id="wc-qrem-${q.key}" value="${escapeHtml(a.remarks||'')}"></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div>
+
+    <div class="grid-2">
+      <div class="field"><label>Work Start Date</label><input type="date" id="wc-workstart" value="${escapeHtml(cert.workStart||'')}"></div>
+      <div class="field"><label>Work Completed Date</label><input type="date" id="wc-workcomplete" value="${escapeHtml(cert.workCompleted||'')}"></div>
+      <div class="field"><label>Site Hand Over — From</label><input type="date" id="wc-shofrom" value="${escapeHtml(cert.siteHandoverFrom||'')}"></div>
+      <div class="field"><label>Site Hand Over — To</label><input type="date" id="wc-shoto" value="${escapeHtml(cert.siteHandoverTo||'')}"></div>
+      <div class="field"><label>Outage Period — From</label><input type="date" id="wc-outfrom" value="${escapeHtml(cert.outageFrom||'')}"></div>
+      <div class="field"><label>Outage Period — To</label><input type="date" id="wc-outto" value="${escapeHtml(cert.outageTo||'')}"></div>
+      <div class="field"><label>MIGO No.</label><input type="text" id="wc-migono" value="${escapeHtml(cert.migoNo||'')}"></div>
+      <div class="field"><label>Service Entry No.</label><input type="text" id="wc-sesno" value="${escapeHtml(cert.serviceEntryNo||'')}"></div>
+    </div>
+
+    <div class="card-head" style="margin-top:10px"><h3 style="font-size:14px">Document Attachment List</h3>
+      <select id="wc-doc-preset" onchange="applyDocPresetToCert(this.value)" style="width:auto">
+        <option value="">Apply preset…</option>
+        ${Object.keys(WO_DOC_PRESETS).map(k=>`<option value="${k}">${WO_DOC_PRESETS[k].label}</option>`).join('')}
+      </select>
+    </div>
+    <div id="wc-doc-list">${cert.docs.map(d=>`
+      <div class="flex gap-2" style="align-items:center; margin-bottom:6px" data-dockey="${escapeHtml(d.key)}">
+        <input type="checkbox" class="wc-doc-cb" ${d.selected?'checked':''}>
+        <input type="text" class="wc-doc-label" value="${escapeHtml(d.label)}" style="flex:1">
+        <select class="wc-doc-status" style="width:auto"><option ${d.status==='Yes'?'selected':''}>Yes</option><option ${d.status==='No'?'selected':''}>No</option><option ${(!d.status||d.status==='NA')?'selected':''}>NA</option></select>
+        <button class="btn btn-danger btn-sm" onclick="this.closest('[data-dockey]').remove()">✕</button>
+      </div>`).join('')}</div>
+    <button class="btn btn-ghost btn-sm" onclick="addCertDocRow()">+ Add Document</button>
+  `;
+}
+function applyDocPresetToCert(presetKey){
+  if (!presetKey) return;
+  const list = document.getElementById('wc-doc-list');
+  list.innerHTML = WO_DOC_PRESETS[presetKey].keys.map(k=>`
+    <div class="flex gap-2" style="align-items:center; margin-bottom:6px" data-dockey="${k}">
+      <input type="checkbox" class="wc-doc-cb" checked>
+      <input type="text" class="wc-doc-label" value="${escapeHtml(woDocLabel(k))}" style="flex:1">
+      <select class="wc-doc-status" style="width:auto"><option>Yes</option><option>No</option><option selected>NA</option></select>
+      <button class="btn btn-danger btn-sm" onclick="this.closest('[data-dockey]').remove()">✕</button>
+    </div>`).join('');
+}
+function addCertDocRow(){
+  const list = document.getElementById('wc-doc-list');
+  const row = document.createElement('div');
+  row.className='flex gap-2'; row.style.cssText='align-items:center; margin-bottom:6px';
+  row.setAttribute('data-dockey', uid('doc'));
+  row.innerHTML = `<input type="checkbox" class="wc-doc-cb" checked>
+    <input type="text" class="wc-doc-label" placeholder="Document name" style="flex:1">
+    <select class="wc-doc-status" style="width:auto"><option>Yes</option><option>No</option><option selected>NA</option></select>
+    <button class="btn btn-danger btn-sm" onclick="this.closest('[data-dockey]').remove()">✕</button>`;
+  list.appendChild(row);
+}
+function readWoCertificateForm(){
+  const val = (id)=> { const el=document.getElementById(id); return el?el.value.trim():''; };
+  const qa = {};
+  WO_CERT_QUESTIONS.forEach(q=>{
+    qa[q.key] = { ans: val('wc-qans-'+q.key), remarks: val('wc-qrem-'+q.key), amount: q.hasAmount?val('wc-qamt-'+q.key):'' };
+  });
+  const docs = Array.from(document.querySelectorAll('#wc-doc-list [data-dockey]')).map(r=>({
+    key: r.dataset.dockey, label: r.querySelector('.wc-doc-label').value.trim(),
+    selected: r.querySelector('.wc-doc-cb').checked, status: r.querySelector('.wc-doc-status').value,
+  })).filter(d=>d.label);
+  return {
+    vendorName: val('wc-vendor'), certBillNo: val('wc-billno'),
+    woNoOverride: val('wc-wono'), woDateOverride: val('wc-wodate'),
+    poNoOverride: val('wc-pono'), poDateOverride: val('wc-podate'),
+    btsNo: val('wc-bts'), sesMigoOverride: val('wc-sesmigo'),
+    qa, workStart: val('wc-workstart'), workCompleted: val('wc-workcomplete'),
+    siteHandoverFrom: val('wc-shofrom'), siteHandoverTo: val('wc-shoto'),
+    outageFrom: val('wc-outfrom'), outageTo: val('wc-outto'),
+    migoNo: val('wc-migono'), serviceEntryNo: val('wc-sesno'), docs,
+  };
+}
+async function submitWoBillModal(woId, billId){
+  const billNo = document.getElementById('wb-billno').value.trim();
+  const billDate = document.getElementById('wb-billdate').value;
+  const poNo = document.getElementById('wb-pono').value.trim();
+  const poDate = document.getElementById('wb-podate').value;
+  const migoSes = document.getElementById('wb-migoses').value.trim();
+  const amount = parseFloat(document.getElementById('wb-amount').value)||0;
+  const otherDetails = document.getElementById('wb-other').value.trim();
+  const certificate = readWoCertificateForm();
+  const err = document.getElementById('wb-error'); err.style.display='none';
+  const btn = document.getElementById('wb-submit-btn');
+  const bill = { id: billId||undefined, billNo, billDate, poNo, poDate, migoSes, amount, otherDetails, certificate };
+  await withSaveStatus(btn, async ()=>{
+    const res = await apiPost({action:'saveWoBill', woId, bill, userId:ST.user.id, role:ST.user.role});
+    if (!res.ok){ err.textContent=res.error||'Failed.'; err.style.display='block'; return false; }
+    await refreshWorkOrders();
+    closeModal();
+    if (WO.openId===woId) renderWoDetailBody();
+  }, billId?'Bill updated.':'Bill added.');
+}
+
+// ── Bill Certificate: preview, Excel export, print (PDF) ──
+function billCertificateRows(w, bill){
+  const c = bill.certificate || emptyWoCertificate(w);
+  const header = [
+    ['Vendor Name', c.vendorName||'—'],
+    ['Certificate for Bill No', c.certBillNo||bill.billNo||'—'],
+    ['Work Order No', c.woNoOverride||(w.fields||{}).woNo||'—'],
+    ['Work Order Date', fmtDate(c.woDateOverride)||'—'],
+    ['PO No', c.poNoOverride||bill.poNo||'—'],
+    ['PO Date', fmtDate(c.poDateOverride||bill.poDate)||'—'],
+    ['BTS No.', c.btsNo||'—'],
+    ['SES / MIGO', c.sesMigoOverride||bill.migoSes||'—'],
+  ];
+  const qaRows = WO_CERT_QUESTIONS.map((q,i)=>{
+    const a=c.qa[q.key]||{ans:'',remarks:'',amount:''};
+    return [String(i+1), q.text + (q.hasAmount && a.amount ? ` (₹${a.amount})` : ''), a.ans||'', a.remarks||''];
+  });
+  const extraRows = [
+    ['9','Work start date / Completed date', (fmtDate(c.workStart)||'—')+' / '+(fmtDate(c.workCompleted)||'—'), ''],
+    ['10','Site Hand Over — From / To', (fmtDate(c.siteHandoverFrom)||'—')+' / '+(fmtDate(c.siteHandoverTo)||'—'), ''],
+    ['11','Outage Period — From / To', (fmtDate(c.outageFrom)||'—')+' / '+(fmtDate(c.outageTo)||'—'), ''],
+    ['12','MIGO No.', c.migoNo||'—', ''],
+    ['13','Service Entry No.', c.serviceEntryNo||'—', ''],
+  ];
+  const docRows = (c.docs||[]).filter(d=>d.selected).map((d,i)=>[String(i+1), d.label, d.status||'NA']);
+  return { header, qaRows: qaRows.concat(extraRows), docRows };
+}
+function previewBillCertificate(woId, billId){
+  const w = woById(woId); const bill = w.bills.find(b=>b.id===billId);
+  if (!bill){ toast('Bill not found','err'); return; }
+  const { header, qaRows, docRows } = billCertificateRows(w, bill);
+  openModal(`
+    <div class="modal-head"><h3>Bill Certificate Preview</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="table-wrap"><table><tbody>${header.map(r=>`<tr><td class="fw-700" style="width:40%">${escapeHtml(r[0])}</td><td>${escapeHtml(r[1])}</td></tr>`).join('')}</tbody></table></div>
+    <div class="table-wrap mt-2"><table>
+      <thead><tr><th>Sr.</th><th>Particulars</th><th>Answer</th><th>Remarks</th></tr></thead>
+      <tbody>${qaRows.map(r=>`<tr><td class="mono text-muted">${escapeHtml(r[0])}</td><td>${escapeHtml(r[1])}</td><td>${escapeHtml(r[2])}</td><td class="text-sm text-muted">${escapeHtml(r[3])}</td></tr>`).join('')}</tbody>
+    </table></div>
+    <h3 class="mt-2" style="font-size:14px">Document Attachment List</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Sr.</th><th>Document</th><th>Attached</th></tr></thead>
+      <tbody>${docRows.length?docRows.map(r=>`<tr><td class="mono text-muted">${escapeHtml(r[0])}</td><td>${escapeHtml(r[1])}</td><td>${escapeHtml(r[2])}</td></tr>`).join(''):'<tr><td colspan="3" class="text-muted text-sm">No documents selected.</td></tr>'}</tbody>
+    </table></div>
+    <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
+      <button class="btn btn-gold" onclick="exportBillCertificateExcel('${woId}','${billId}')">⬇ Excel</button>
+      <button class="btn btn-gold" onclick="printBillCertificate('${woId}','${billId}')">🖨 Print / PDF</button>
+    </div>
+  `, true);
+}
+async function exportBillCertificateExcel(woId, billId){
+  const w = woById(woId); const bill = w.bills.find(b=>b.id===billId);
+  if (!bill){ toast('Bill not found','err'); return; }
+  const { header, qaRows, docRows } = billCertificateRows(w, bill);
+  try {
+    const X = await ensureSheetJS();
+    const rows = [];
+    rows.push([MSETCL_HEADER_LINE1]); rows.push(['BILL CERTIFICATE']);
+    header.forEach(r=> rows.push(r));
+    rows.push([]);
+    rows.push(['Sr.No.','Particulars','Answer','Remarks']);
+    qaRows.forEach(r=> rows.push(r));
+    rows.push([]);
+    rows.push(['Document Attachment List','','','']);
+    rows.push(['Sr.No.','Document','Attached','']);
+    docRows.forEach(r=> rows.push([r[0],r[1],r[2],'']));
+    rows.push([]); rows.push(['All above information, I certify is true and correct.']);
+    const ws = X.utils.aoa_to_sheet(rows);
+    ws['!cols'] = [{wch:6},{wch:60},{wch:12},{wch:34}];
+    applyMsetclHeaderBanner(ws, 4, 2);
+    applyRowStyles(ws, {2:'header'}, 4);
+    const wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, ws, 'Bill Certificate');
+    await writeXlsxWithFreeze(wb, `Bill_Certificate_${(bill.billNo||billId).replace(/[^a-z0-9]+/gi,'_')}.xlsx`);
+    toast('Excel downloaded.','ok');
+  } catch(e){ console.error(e); toast('Export failed: '+(e.message||'error'),'err',6000); }
+}
+function printBillCertificate(woId, billId){
+  const w = woById(woId); const bill = w.bills.find(b=>b.id===billId);
+  if (!bill){ toast('Bill not found','err'); return; }
+  const { header, qaRows, docRows } = billCertificateRows(w, bill);
+  ST._printOrient = 'portrait';
+  const root = document.createElement('div'); root.id='PRINT_ROOT';
+  root.innerHTML = `<style>${sharedPrintCSS()}</style>
+    <div class="pg">
+      <div class="print-banner" style="text-align:center; margin-bottom:8px">
+        <div style="font-weight:800; font-size:19px; background:#D9DDE3; padding:2px 0">${escapeHtml(MSETCL_HEADER_LINE1)}</div>
+        <div style="font-weight:800; font-size:15px; background:#D9DDE3; padding:2px 0">BILL CERTIFICATE</div>
+      </div>
+      ${printHtmlTable([['Field','Value']].concat(header), {widths:[35,65], leftCol:(i)=>i===0||i===1})}
+      ${printHtmlTable([['Sr.','Particulars','Answer','Remarks']].concat(qaRows), {widths:[6,54,14,26], leftCol:(i)=>i===1||i===3})}
+      <h3>Document Attachment List</h3>
+      ${printHtmlTable([['Sr.','Document','Attached']].concat(docRows.length?docRows:[['—','No documents selected','—']]), {widths:[8,72,20], leftCol:(i)=>i===1})}
+      <p style="margin-top:14px; font-size:12px">All above information, I certify is true and correct.</p>
+    </div>`;
+  doPrintAndCleanup(root);
+}
 
 document.addEventListener('DOMContentLoaded', () => {
   boot();
