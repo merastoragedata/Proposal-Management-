@@ -8,7 +8,7 @@
 /* Build stamp. Check the live site is running this file:
    open the browser console (F12) — the build id is printed on load.
    It is also shown at the bottom-right of the login screen. */
-window.__BUILD = "2026-09-28-wo-sync";
+window.__BUILD = "2026-09-29-wo-alerts-cert-fmt";
 document.addEventListener("DOMContentLoaded", function(){
   var el = document.createElement("div");
   el.id = "build-stamp";
@@ -1197,6 +1197,8 @@ function renderDashboardPage() {
       ${canEdit() ? `<button class="btn btn-gold" onclick="navigateTo('estimate-new')">+ New Estimate</button>` : ''}
     </div>
 
+    <div id="wo-alert-zone"></div>
+
     <div class="stats-grid" style="margin-bottom:16px">
       <div class="card-tight card stat-card">
         <div class="stat-ic">📊</div>
@@ -1251,6 +1253,8 @@ function renderDashboardPage() {
   ensureDashSelection(list);
   renderDashboardList(list);
   updateDashSelCount();
+  renderWoAlertZone();
+  refreshWorkOrders().then(renderWoAlertZone);
 }
 
 let _dashSearchT = null;
@@ -5065,29 +5069,28 @@ async function exportEstimatePDF(){
 function sharedPrintCSS() {
   return `
     #PRINT_ROOT{ font-family:'Arial Nova Cond','Arial Narrow',Arial,sans-serif; color:#000; }
-    #PRINT_ROOT h2{ background:#D9DDE3; color:#000; padding:9px 14px; margin:0 0 10px; font-size:16px; font-weight:bold; border-radius:4px 4px 0 0; border-bottom:3px solid #9AA3AF; }
-    #PRINT_ROOT h3{ color:#000; background:#E3E6EB; padding:6px 12px; margin:16px 0 8px; font-size:13px; font-weight:bold; border-left:4px solid #9AA3AF; }
+    #PRINT_ROOT h2{ background:#D9DDE3; color:#000; padding:9px 14px; margin:0 0 10px; font-size:18px; font-weight:bold; border-radius:4px 4px 0 0; border-bottom:3px solid #9AA3AF; }
+    #PRINT_ROOT h3{ color:#000; background:#E3E6EB; padding:6px 12px; margin:16px 0 8px; font-size:14.5px; font-weight:bold; border-left:4px solid #9AA3AF; }
     #PRINT_ROOT table{ width:100%; border-collapse:collapse; margin-bottom:16px; table-layout:fixed; border:1px solid #B7BEC9; }
     #PRINT_ROOT th{
-      background:#EFF1F4; color:#000; text-align:left; padding:7px 7px; font-size:11px; font-weight:bold;
+      background:#EFF1F4; color:#000; text-align:left; padding:8px 8px; font-size:12.5px; font-weight:bold;
       white-space:normal; word-break:break-word; vertical-align:middle; line-height:1.3;
       border:1px solid #B7BEC9; border-bottom:2px solid #9AA3AF;
     }
     /* full grid on every cell, matching the Excel exports */
-    #PRINT_ROOT td{ padding:6px 7px; font-size:11px; line-height:1.35; border:1px solid #D5DAE1; word-wrap:break-word; overflow-wrap:break-word; vertical-align:top; }
+    #PRINT_ROOT td{ padding:7px 8px; font-size:12.5px; line-height:1.4; border:1px solid #D5DAE1; word-wrap:break-word; overflow-wrap:break-word; vertical-align:top; }
     #PRINT_ROOT td.num{ text-align:center; font-variant-numeric:tabular-nums; }
     #PRINT_ROOT td.ctr{ text-align:center; }
     #PRINT_ROOT td.lft{ text-align:left; }
     #PRINT_ROOT thead{ display:table-header-group; }   /* repeat header row on every page */
     #PRINT_ROOT td, #PRINT_ROOT th{ overflow-wrap:anywhere; }
     /* "dense" tables (many columns, e.g. item-level exports) still get a
-       readable floor — never below 9.5px, the smallest size comfortably
-       readable on a printed A4 page. */
-    #PRINT_ROOT table.dense td{ font-size:9.5px; padding:5px 5px; }
-    #PRINT_ROOT table.dense th{ font-size:9.5px; padding:5px 5px; }
-    #PRINT_ROOT table.dense td.num{ font-size:9.5px; }
+       readable floor — never below 11px, comfortably legible on A4. */
+    #PRINT_ROOT table.dense td{ font-size:11px; padding:6px 6px; }
+    #PRINT_ROOT table.dense th{ font-size:11px; padding:6px 6px; }
+    #PRINT_ROOT table.dense td.num{ font-size:11px; }
     #PRINT_ROOT tr{ page-break-inside:avoid; }
-    #PRINT_ROOT tr.breakdown-row td{ color:#6B7280; font-size:9.5px; font-style:italic; border-top:none; background:#fff; }
+    #PRINT_ROOT tr.breakdown-row td{ color:#6B7280; font-size:11px; font-style:italic; border-top:none; background:#fff; }
     #PRINT_ROOT tr.total-row td{ background:#E9EBEE; font-weight:bold; color:#000; }
     /* Section starts: any element with .pg-section-start always begins a
        fresh page, regardless of position in the document. */
@@ -6705,6 +6708,24 @@ async function saveSignatoriesAsDefault(){
 
 function onOrderDetailInput(key, val) {
   ST.currentEstimate.progress.orderDetails[key] = val;
+  if (key === 'loiNo') {
+    clearTimeout(_loiLinkTimer);
+    if (val && val.trim()) _loiLinkTimer = setTimeout(()=> triggerLoiLink(ST.currentEstimate.id), 700);
+  }
+}
+let _loiLinkTimer = null;
+// Fires the moment an LOI No. is entered (Order Related Details) or Proposal
+// Stage 11 "LOI Issued" is checked — links this Estimate into Work Orders
+// immediately instead of waiting for the manual bulk-import button.
+async function triggerLoiLink(estimateId){
+  if (!estimateId) return; // save the estimate first — nothing to link yet
+  try {
+    const res = await apiPost({action:'linkEstimateLoiToWo', estimateId, userId:ST.user.id, role:ST.user.role});
+    if (res && res.ok && res.linked) {
+      await refreshWorkOrders();
+      toast('LOI detected — a Work Order was created for this Estimate. Set its office level under Work Orders.', 'ok', 7000);
+    }
+  } catch(e) { /* silent — background sync, not critical to the current task */ }
 }
 function onProcessedViaChange(val) {
   ST.currentEstimate.progress.orderDetails.processedVia = val;
@@ -6741,7 +6762,7 @@ function toggleStage(id) {
   const checkEl = row.querySelector('.stage-check');
   checkEl.classList.toggle('done', stage.done);
   checkEl.textContent = stage.done ? '✓' : '';
-  if (id === LOI_STAGE_ID) renderFinancialTracking(!canEdit() || !ownsEstimate(est));
+  if (id === LOI_STAGE_ID) { renderFinancialTracking(!canEdit() || !ownsEstimate(est)); if (stage.done) triggerLoiLink(est.id); }
 }
 function onStageRemarkInput(id, val) {
   ST.currentEstimate.progress.stages[id].remarks = val;
@@ -9276,6 +9297,38 @@ let WO = { level:'All', search:'', openId:null };
 function canWoEdit(){ return !!(ST.woAllowed || isAdmin()); }
 function woList(){ return ST.workOrdersCache || []; }
 function woById(id){ return woList().find(w=>w.id===id); }
+// Dashboard alert: expiry within 120 days, or 60%+ of the WO amount billed
+// — whichever condition is met first for a given Work Order.
+function woAlertItems(){
+  const now = new Date();
+  const items = [];
+  woList().forEach(w=>{
+    const reasons = [];
+    if (w.expiryDate){
+      const days = Math.ceil((new Date(w.expiryDate) - now) / 86400000);
+      if (days < 0) reasons.push(`Expired ${fmtDate(w.expiryDate)}`);
+      else if (days <= 120) reasons.push(`Expires in ${days} day${days!==1?'s':''} (${fmtDate(w.expiryDate)})`);
+    }
+    if (w.woAmount>0){
+      const pct = (w.billTotal/w.woAmount)*100;
+      if (pct>=60) reasons.push(`${Math.round(pct)}% of WO amount billed`);
+    }
+    if (reasons.length) items.push({w, reasons});
+  });
+  return items;
+}
+function renderWoAlertZone(){
+  const zone = document.getElementById('wo-alert-zone'); if (!zone) return;
+  const items = woAlertItems();
+  if (!items.length){ zone.innerHTML=''; return; }
+  zone.innerHTML = `<div class="card" style="margin-bottom:16px; border-left:4px solid #dc2626; background:#fef2f2">
+    <div class="fw-700" style="color:#991b1b; margin-bottom:6px">⚠ ${items.length} Work Order${items.length!==1?'s':''} need attention</div>
+    ${items.slice(0,6).map(it=>`<div class="text-sm" style="margin-bottom:4px; cursor:pointer" onclick="navigateTo('work-orders'); setTimeout(()=>openWoDetail('${it.w.id}'),80)">
+      <b>${escapeHtml(woIdentityText(it.w))}</b> — ${it.reasons.join(' · ')}
+    </div>`).join('')}
+    ${items.length>6?`<div class="text-xs text-muted">+ ${items.length-6} more — open Work Orders to see all.</div>`:''}
+  </div>`;
+}
 function woIdentityText(w){
   const parts = (ST.woFieldDefs||[]).map(f=>(w.fields||{})[f.key]).filter(Boolean);
   return (w.title ? w.title+' — ' : '') + (parts.join(' · ') || '(no fields filled)');
@@ -9451,6 +9504,8 @@ function openWoModal(id=null){
     }</div>`).join('')}
     <div class="field"><label>Work Order Amount (₹)</label>
       <input type="number" id="wo-amount" step="0.01" value="${w?w.woAmount:''}"></div>
+    <div class="field"><label>Expiry / Validity Date <span class="text-xs text-muted">(used for the dashboard alert)</span></label>
+      <input type="date" id="wo-expiry" value="${w?escapeHtml(w.expiryDate||''):''}"></div>
     <div class="field"><label>Remarks</label>${longTextInput('wo-remarks', w?w.remarks:'', {rows:3})}</div>
     ${!w?`<p class="hint">Save the Work Order first, then attach documents (LOI, letters, etc.) from its detail view.</p>`:''}
     <div id="wo-error" class="error-text" style="display:none"></div>
@@ -9461,12 +9516,13 @@ async function submitWoModal(id){
   const level = document.getElementById('wo-level').value;
   const title = document.getElementById('wo-title').value.trim();
   const woAmount = parseFloat(document.getElementById('wo-amount').value)||0;
+  const expiryDate = document.getElementById('wo-expiry').value;
   const remarks = document.getElementById('wo-remarks').value.trim();
   const fields = {};
   document.querySelectorAll('.wo-field-input').forEach(el=> fields[el.dataset.key]=el.value.trim());
   const err = document.getElementById('wo-error'); err.style.display='none';
   const btn = document.getElementById('wo-submit-btn');
-  const payload = { id: id||undefined, level, title, fields, woAmount, remarks, ownerName: ST.user.name||ST.user.id };
+  const payload = { id: id||undefined, level, title, fields, woAmount, expiryDate, remarks, ownerName: ST.user.name||ST.user.id };
   await withSaveStatus(btn, async ()=>{
     const res = await apiPost({action:'saveWorkOrder', workOrder:payload, userId:ST.user.id, role:ST.user.role});
     if (!res.ok){ err.textContent=res.error||'Failed.'; err.style.display='block'; return false; }
@@ -9569,6 +9625,7 @@ function renderWoDetailBody(){
         <tbody>
           ${defs.map(d=>`<tr><td class="fw-700" style="width:40%">${escapeHtml(d.label)}</td><td>${escapeHtml((w.fields||{})[d.key]||'—')}</td></tr>`).join('')}
           <tr><td class="fw-700">Remarks</td><td>${escapeHtml(w.remarks||'—')}</td></tr>
+          <tr><td class="fw-700">Expiry / Validity Date</td><td>${w.expiryDate?escapeHtml(fmtDate(w.expiryDate)):'—'}</td></tr>
           <tr><td class="fw-700">Documents</td><td>
             ${docs.length? docs.map(d=>`<div class="flex gap-2" style="align-items:center; margin-bottom:4px">
               <a href="${d.url}" target="_blank" rel="noopener">📎 ${escapeHtml(d.label||d.fileName)}</a>
@@ -9709,7 +9766,7 @@ async function submitWoDocDefaults(woId){
   const rows = Array.from(document.querySelectorAll('#wo-doc-default-list [data-dkey]'));
   const docDefaults = rows.map(r=>({ key:r.dataset.dkey, label:r.querySelector('.wo-doc-label').value.trim() })).filter(d=>d.label);
   const w = woById(woId);
-  const res = await apiPost({action:'saveWorkOrder', workOrder:{id:woId, level:w.level, title:w.title, fields:w.fields, woAmount:w.woAmount, remarks:w.remarks, docDefaults}, userId:ST.user.id, role:ST.user.role});
+  const res = await apiPost({action:'saveWorkOrder', workOrder:{id:woId, level:w.level, title:w.title, fields:w.fields, woAmount:w.woAmount, expiryDate:w.expiryDate, remarks:w.remarks, docDefaults}, userId:ST.user.id, role:ST.user.role});
   if (!res.ok){ toast(res.error||'Failed.','err'); return; }
   await refreshWorkOrders();
   closeModal(); toast('Default documents saved.','ok');
@@ -9978,19 +10035,32 @@ async function exportBillCertificateExcel(woId, billId){
   try {
     const X = await ensureSheetJS();
     const rows = [];
+    const leftA = new Set(), leftB = new Set(); // rows (0-idx) that need explicit left-align, per the reference layout
     rows.push([MSETCL_HEADER_LINE1]); rows.push(['BILL CERTIFICATE']);
-    header.forEach(r=> rows.push(r));
+    header.forEach(r=>{ leftA.add(rows.length); leftB.add(rows.length); rows.push(r); });
     rows.push([]);
-    rows.push(['Sr.No.','Particulars','Answer','Remarks']);
-    qaRows.forEach(r=> rows.push(r));
+    leftA.add(rows.length); leftB.add(rows.length); rows.push(['Sr.No.','Particulars','Answer','Remarks']);
+    qaRows.forEach(r=>{ leftB.add(rows.length); rows.push(r); });
     rows.push([]);
-    rows.push(['Document Attachment List','','','']);
-    rows.push(['Sr.No.','Document','Attached','']);
-    docRows.forEach(r=> rows.push([r[0],r[1],r[2],'']));
-    rows.push([]); rows.push(['All above information, I certify is true and correct.']);
+    leftA.add(rows.length); rows.push(['Document Attachment List','','','']);
+    leftA.add(rows.length); leftB.add(rows.length); rows.push(['Sr.No.','Document','Attached','']);
+    docRows.forEach(r=>{ leftB.add(rows.length); rows.push([r[0],r[1],r[2],'']); });
+    rows.push([]);
+    const certifyRow = rows.length; rows.push(['All above information, I certify is true and correct.','','','']);
     const ws = X.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{wch:6},{wch:60},{wch:12},{wch:34}];
+    ws['!cols'] = [{wch:26},{wch:60},{wch:19},{wch:35}];
     applyMsetclHeaderBanner(ws, 4, 2);
+    // Column A/B alignment: labels/headers left, numbered Sr.No cells stay
+    // default-centered (matches the manually-formatted reference file).
+    leftA.forEach(r=>{ const ad=X.utils.encode_cell({r,c:0}); if(ws[ad]) ws[ad].s=Object.assign({},ws[ad].s,{alignment:{horizontal:'left',vertical:'center',wrapText:true}}); });
+    leftB.forEach(r=>{ const ad=X.utils.encode_cell({r,c:1}); if(ws[ad]) ws[ad].s=Object.assign({},ws[ad].s,{alignment:{horizontal:'left',vertical:'center',wrapText:true}}); });
+    // Certify line — merged across all 4 columns, left-aligned.
+    ws['!merges'] = ws['!merges'] || [];
+    ws['!merges'].push({s:{r:certifyRow,c:0}, e:{r:certifyRow,c:3}});
+    const certAddr = X.utils.encode_cell({r:certifyRow,c:0});
+    ws[certAddr].s = { font:{name:EXPORT_FONT, sz:14, color:{rgb:'000000'}}, alignment:{horizontal:'left', vertical:'center', wrapText:true} };
+    beautifySheet(ws);
+    autoRowHeights(ws, 14, {0:27, 1:30});
     const wb = X.utils.book_new();
     X.utils.book_append_sheet(wb, ws, 'Bill Certificate');
     await writeXlsxWithFreeze(wb, `Bill_Certificate_${(bill.billNo||billId).replace(/[^a-z0-9]+/gi,'_')}.xlsx`);
@@ -10094,8 +10164,12 @@ function openWoReportModal(){
         <input type="checkbox" class="wo-rep-level" value="${l}" ${l==='All'?'checked':''} onchange="onWoReportLevelToggle(this)">
         <span>${l}</span></label>`).join('')}
     </div>
-    <label class="flex gap-2" style="align-items:center; margin-bottom:12px">
+    <label class="flex gap-2" style="align-items:center; margin-bottom:8px">
       <input type="checkbox" id="wo-rep-bills" checked><span>Include billing details (bills + amounts)</span>
+    </label>
+    <label class="flex gap-2" style="align-items:center; margin-bottom:12px">
+      <input type="checkbox" id="wo-rep-balance" checked>
+      <span>Calculate &amp; show remaining balance <span class="text-xs text-muted">(for Circle/Zone/HO Work Orders, the WO Amount may only be a reference figure — untick if that office doesn't track balance here)</span></span>
     </label>
     <div class="flex gap-2" style="flex-wrap:wrap">
       <button class="btn btn-gold" onclick="exportWoReportExcel()">⬇ Excel</button>
@@ -10117,11 +10191,12 @@ function selectedWoReportLevels(){
 function woReportData(){
   const levels = selectedWoReportLevels();
   const includeBills = document.getElementById('wo-rep-bills').checked;
+  const calcBalance = document.getElementById('wo-rep-balance').checked;
   const grouped = levels.map(l=>({ level:l, items: woList().filter(w=>w.level===l) }));
-  return { levels, includeBills, grouped };
+  return { levels, includeBills, calcBalance, grouped };
 }
 async function exportWoReportExcel(){
-  const { includeBills, grouped } = woReportData();
+  const { includeBills, calcBalance, grouped } = woReportData();
   try {
     const X = await ensureSheetJS();
     const wb = X.utils.book_new();
@@ -10130,10 +10205,11 @@ async function exportWoReportExcel(){
       const rows = [];
       rows.push([MSETCL_HEADER_LINE1]); rows.push(['WORK ORDERS REPORT — '+g.level]);
       rows.push([]);
-      rows.push(defs.map(d=>d.label).concat(['WO Amount','Billed','Remaining']));
+      const amtCols = calcBalance ? ['WO Amount','Billed','Remaining'] : ['WO Amount'];
+      rows.push(defs.map(d=>d.label).concat(amtCols));
       g.items.forEach(w=>{
         const base = defs.map(d=>(w.fields||{})[d.key]||'');
-        rows.push(base.concat([w.woAmount, w.billTotal, w.remaining]));
+        rows.push(base.concat(calcBalance ? [w.woAmount, w.billTotal, w.remaining] : [w.woAmount]));
         if (includeBills && w.bills.length){
           rows.push(['↳ Bills for above WO:']);
           rows.push(['Bill No','Bill Date','PO No','PO Date','MIGO/SES','Amount','Other']);
@@ -10150,15 +10226,16 @@ async function exportWoReportExcel(){
   } catch(e){ console.error(e); toast('Export failed: '+(e.message||'error'),'err',6000); }
 }
 function printWoReport(){
-  const { includeBills, grouped } = woReportData();
+  const { includeBills, calcBalance, grouped } = woReportData();
   const defs = ST.woFieldDefs||[];
-  const cols = defs.map(d=>d.label).concat(['WO Amt','Billed','Remaining']);
+  const amtCols = calcBalance ? ['WO Amt','Billed','Remaining'] : ['WO Amt'];
+  const cols = defs.map(d=>d.label).concat(amtCols);
   const nCols = cols.length;
   const widths = cols.map(()=> Math.floor(100/nCols));
   const sections = grouped.map(g=>{
     const rows = g.items.map(w=>{
       const base = defs.map(d=>(w.fields||{})[d.key]||'—');
-      return base.concat([fmtINR(w.woAmount), fmtINR(w.billTotal), fmtINR(w.remaining)]);
+      return base.concat(calcBalance ? [fmtINR(w.woAmount), fmtINR(w.billTotal), fmtINR(w.remaining)] : [fmtINR(w.woAmount)]);
     });
     let billsHtml = '';
     if (includeBills){
