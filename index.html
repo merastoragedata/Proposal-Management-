@@ -8,7 +8,7 @@
 /* Build stamp. Check the live site is running this file:
    open the browser console (F12) — the build id is printed on load.
    It is also shown at the bottom-right of the login screen. */
-window.__BUILD = "2026-09-29-wo-alerts-cert-fmt";
+window.__BUILD = "2026-10-24-indian-excel-fmt";
 document.addEventListener("DOMContentLoaded", function(){
   var el = document.createElement("div");
   el.id = "build-stamp";
@@ -2061,12 +2061,34 @@ function autoRowHeights(ws, defaultFontSz=12, mins){
     rowsArr[r] = Object.assign({}, rowsArr[r], { hpt: h });
   }
 }
-const LUXE_NUMFMT = '#,##,##0.##';        // Indian grouping, decimals only when present
-const RUPEE_FMT   = '"₹"#,##,##0.00';     // ₹ + Indian grouping (amounts with paise)
+// Excel cannot express lakh/crore grouping with one pattern ('#,##,##0' is shown
+// as 12,345,678). A real Indian format needs conditional sections + escaped
+// literal commas, chosen by magnitude. Cells stay numeric (not text).
+function indianNumFmt(v, rupee, dec) {
+  const n = Number(v) || 0, a = Math.abs(n);
+  const d = (dec == null) ? (Number.isInteger(n) ? '' : '.00') : dec;
+  const p = rupee ? '"₹"' : '';
+  const X0 = '#,##0', X3 = '##\\,##\\,##0', X4 = '##\\,##\\,##\\,##0', X5 = '##\\,##\\,##\\,##\\,##0';
+  if (n < 0) return p + (a >= 1e9 ? X5 : a >= 1e7 ? X4 : a >= 1e5 ? X3 : X0) + d;   // negatives: exact tier, one section
+  if (a >= 1e9) return `[>=1000000000]${p}${X5}${d};[>=10000000]${p}${X4}${d};${p}${X0}${d}`;
+  return `[>=10000000]${p}${X4}${d};[>=100000]${p}${X3}${d};${p}${X0}${d}`;
+}
+const LUXE_NUMFMT = indianNumFmt(0, false, '.##');   // Indian grouping, decimals only when present
+const RUPEE_FMT   = indianNumFmt(0, true, '.00');    // ₹ + Indian grouping (amounts with paise)
 // Per-cell number formats — chosen from the VALUE so integers never show a
 // stray '.' and only true amounts get thousands separators.
 function plainNumFmt(v){ return Number.isInteger(Number(v)) ? '0' : '0.00'; }
-function rupeeNumFmt(v){ return Number.isInteger(Number(v)) ? '"₹"#,##,##0' : '"₹"#,##,##0.00'; }
+function rupeeNumFmt(v){ return indianNumFmt(v, true); }
+function moneyNumFmt(v){ return indianNumFmt(v, false); }   // Indian grouping, no ₹ sign (rate/amount columns)
+// Is this numeric cell a rate/amount (gets Indian commas) rather than a qty/serial/ID (stays plain)?
+// Decided from the column header above it; row label only when the column has no header.
+function luxeIsMoneyCol(hdr, lbl){
+  const t = String(hdr != null ? hdr : (lbl || ''));
+  if (!t) return false;
+  if (/\b(qty|quantity|nos?|sr|sl|count|date|uom|year|fy|page|version|code)\b/i.test(t)) return false;
+  return /(₹|\brs\b|rupee|\brates?\b|\bamount|\bcost\b|\bprice|\bvalue\b|\btotal\b|\bbalance\b|\bavailable\b|\bgst\b|\bcess\b|insurance|centage|contingenc|variation|compensation)/i.test(t);
+}
+
 const LUXE_ZEBRA = 'F4F7FC';
 
 function beautifyWorkbook(wb) {
@@ -2092,7 +2114,9 @@ function beautifySheet(ws) {
   }
   // pass 2 — apply borders + defaults + zebra + number formatting
   let bodyIdx = 0;
+  const _lastStr = {};   // column -> nearest text above (its header)
   for (let r = range.s.r; r <= range.e.r; r++) {
+    let _rowLbl = '';
     const isThemed = !!themed[r];
     // Zebra ONLY on item rows — identified by a numeric serial in column A.
     const c0 = ws[XLSX.utils.encode_cell({ r, c:0 })];
@@ -2112,9 +2136,10 @@ function beautifySheet(ws) {
       if (s.font && !s.font.sz) s.font.sz = 14;
       s.alignment = Object.assign({ vertical:'center' }, s.alignment || {});
       const isNum = cell.t === 'n' || typeof cell.v === 'number';
+      if (!isNum && typeof cell.v === 'string' && cell.v.trim() !== '') { _lastStr[c] = cell.v; if (_rowLbl === '') _rowLbl = cell.v; }
       if (isNum) {
         if (!s.alignment.horizontal) s.alignment.horizontal = 'center';   // edited sheet centres numbers
-        if (!s.numFmt) s.numFmt = plainNumFmt(cell.v);   // no commas unless it's an amount
+        if (!s.numFmt) s.numFmt = luxeIsMoneyCol(_lastStr[c], _lastStr[c]==null ? _rowLbl : null) ? moneyNumFmt(cell.v) : plainNumFmt(cell.v);   // Indian commas for rates/amounts; plain for qty/serials/IDs
         // shrink-to-fit prevents '###' when a value is wider than its column
         if (!('shrinkToFit' in s.alignment)) s.alignment.shrinkToFit = true;
         if (!wrapPreset) s.alignment.wrapText = false;   // numbers shrink, don't wrap
@@ -9994,7 +10019,7 @@ function billCertificateRows(w, bill){
   ];
   const qaRows = WO_CERT_QUESTIONS.map((q,i)=>{
     const a=c.qa[q.key]||{ans:'',remarks:'',amount:''};
-    return [String(i+1), q.text + (q.hasAmount && a.amount ? ` (₹${a.amount})` : ''), a.ans||'—', a.remarks||''];
+    return [String(i+1), q.text + (q.hasAmount && a.amount ? ` (${isFinite(+a.amount) ? fmtINR(+a.amount, Number.isInteger(+a.amount)?0:2) : '₹'+a.amount})` : ''), a.ans||'—', a.remarks||''];
   });
   const extraRows = [
     ['9','Work start date / Completed date', (fmtDate(c.workStart)||'—')+' / '+(fmtDate(c.workCompleted)||'—'), ''],
