@@ -8,7 +8,7 @@
 /* Build stamp. Check the live site is running this file:
    open the browser console (F12) — the build id is printed on load.
    It is also shown at the bottom-right of the login screen. */
-window.__BUILD = "2026-10-24-indian-excel-fmt";
+window.__BUILD = "2026-10-24-older-sor-fetch";
 document.addEventListener("DOMContentLoaded", function(){
   var el = document.createElement("div");
   el.id = "build-stamp";
@@ -736,18 +736,37 @@ function prefetchRemainingSOR() {
 
 // Load a single SOR version on demand, once. This is the step-by-step path:
 // nothing is fetched until something actually needs it.
-const _sorVersionsLoaded = new Set();
+const _sorVersionPromises = {};   // version -> in-flight fetch (so concurrent callers wait for the SAME load)
+function sorVersionInCache(version){ return (ST.sorCache||[]).some(it => it.version === version); }
 async function ensureSorVersionLoaded(version){
-  if (!version) return true;
+  if (!version || version === 'NONSOR') return true;
   const latest = resolveLatestVersion(visibleSorVersions());
   if (version === latest) return ensureSorLoaded();
-  if (_sorVersionsLoaded.has(version)) return true;
-  _sorVersionsLoaded.add(version);
-  try {
-    const res = await api('getSOR', {version});
-    if (res.ok) ST.sorCache = (ST.sorCache||[]).concat(res.items||[]);
-  } catch(e) { _sorVersionsLoaded.delete(version); return false; }
-  return true;
+  if (sorVersionInCache(version)) return true;
+  if (_sorVersionPromises[version]) return _sorVersionPromises[version];
+  _sorVersionPromises[version] = (async () => {
+    try {
+      const res = await api('getSOR', {version});
+      if (!res.ok) return false;
+      // replace (never append twice) so a repeated load can't duplicate rows
+      ST.sorCache = (ST.sorCache||[]).filter(it => it.version !== version).concat(res.items||[]);
+      return true;
+    } catch(e) { return false; }
+    finally { delete _sorVersionPromises[version]; }
+  })();
+  return _sorVersionPromises[version];
+}
+// Called when the user ticks version checkboxes: fetch ONLY the ticked versions
+// that aren't in memory yet (one at a time), showing progress in the results table.
+async function ensureCheckedSorVersions(checked, bodyId){
+  const need = (checked||[]).filter(v => v && v !== 'NONSOR' && !sorVersionInCache(v));
+  if (!need.length) return true;
+  const body = document.getElementById(bodyId);
+  if (body) body.innerHTML = `<tr><td colspan="99" class="text-sm text-muted" style="padding:28px;text-align:center">⏳ Loading ${need.map(escapeHtml).join(', ')}…</td></tr>`;
+  const failed = [];
+  for (const v of need) { if (!(await ensureSorVersionLoaded(v))) failed.push(v); }
+  if (failed.length) toast('Could not load ' + failed.join(', ') + ' — check connection and tick it again.', 'err');
+  return !failed.length;
 }
 
 function luxLoaderHTML(label) {
@@ -2610,8 +2629,10 @@ function setAICategory(cat) {
   renderAIResults();
 }
 
-function onAIVersionsChanged(checked) {
+async function onAIVersionsChanged(checked) {
   AI.checkedVersions = checked; AI.page = 1;
+  await ensureCheckedSorVersions(checked, 'ai-results-body');   // older versions are fetched on demand
+  if (AI.checkedVersions !== checked) return;                   // user changed ticks meanwhile; the newer call renders
   renderAIResults();
 }
 const onAISearchInput = debounce(() => {
@@ -5643,7 +5664,12 @@ function renderRPSor(zone) {
   renderVersionCheckboxes('rp-version-checks', RP.checkedVersions, 'onRPVersionsChanged', false);
   renderRPSorTable();
 }
-function onRPVersionsChanged(checked) { RP.checkedVersions = checked; RP.page=1; renderRPSorTable(); }
+async function onRPVersionsChanged(checked) {
+  RP.checkedVersions = checked; RP.page=1;
+  await ensureCheckedSorVersions(checked, 'rp-sor-body');       // older versions are fetched on demand
+  if (RP.checkedVersions !== checked) return;
+  renderRPSorTable();
+}
 function setRPCategory(cat) {
   RP.category = cat; RP.page = 1;
   document.querySelectorAll('#rp-category-pills .radio-pill').forEach(el=>el.classList.toggle('sel', el.dataset.cat===cat));
